@@ -1,0 +1,8 @@
+opencv-python
+numpy
+pillow
+ultralytics
+beautifulsoup4
+requests
+selenium
+googlesearch-python
