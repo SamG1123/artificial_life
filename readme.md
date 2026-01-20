@@ -34,5 +34,3 @@ python main.py
 ```
 
 
-
-## License
