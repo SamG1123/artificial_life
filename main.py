@@ -18,7 +18,7 @@ class main():
     def run(self):
         self.models_init()
         while True:
-            
+            pass
 
 if __name__ == "__main__":
     main = main()
