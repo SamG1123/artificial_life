@@ -1,16 +1,20 @@
+from io import BytesIO
 import cv2
 import numpy as np
 from PIL import Image
+import torch
 from ultralytics import YOLO
 import os
 from groq import Groq
 import base64
-
+from transformers import pipeline, AutoTokenizer, AutoModel
+from dotenv import load_dotenv
+load_dotenv()
 
 class ObjectDetection:
     def __init__(self):
         self.model = YOLO("yolo26n.pt")
-        self.groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.frame_buffer = []
     
     def model_train(self, dataset : str, model_save_path : str):
@@ -40,33 +44,38 @@ class ObjectDetection:
             boxes.append((x1, y1, x2, y2))
         return boxes
 
+    
     def ocr_infer(self, image):
-        # Convert image to base64 for Groq API
-        _, buffer = cv2.imencode('.jpg', image)
-        image_base64 = base64.standard_b64encode(buffer).decode('utf-8')
-        
+        pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        buffered = BytesIO()
+        pil_image.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
         message = self.groq_client.chat.completions.create(
-            model="llava-2-7b",
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}",
-                            },
+                            "type": "text",
+                            "text": "Extract text from the following image:"
                         },
                         {
-                            "type": "text",
-                            "text": "Recognize and extract all text from this image."
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_str}"
+                            }
                         }
-                    ],
+                    ]
                 }
             ],
-            max_tokens=1024,
+            max_tokens=512
         )
-        return message.choices[0].message.content
+        text = message.choices[0].message.content
+        return text
+    
+    def speech_command_infer(self, text : str):
+        self.set_command = text.lower()
 
     def camera_infer(self):
         cap = cv2.VideoCapture(0)
@@ -91,9 +100,13 @@ class ObjectDetection:
                 print("OCR Result:", text)
 
 
-
         cap.release()
         cv2.destroyAllWindows()
+
+    def ocr_test(self, image_path : str):
+        image = cv2.imread(image_path)
+        text = self.ocr_infer(image)
+        return text
 
 if __name__ == "__main__":
     detector = ObjectDetection()
