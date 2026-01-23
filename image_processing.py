@@ -1,5 +1,6 @@
 from io import BytesIO
 import cv2
+import speech_support as ss
 import numpy as np
 from PIL import Image
 import torch
@@ -16,6 +17,8 @@ class ObjectDetection:
         self.model = YOLO("yolo26n.pt")
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.frame_buffer = []
+        self.speech = ss.SpeechSupport()
+
     
     def model_train(self, dataset : str, model_save_path : str):
         self.model.train(data=dataset, epochs=100, imgsz=640, save_path=model_save_path)
@@ -93,12 +96,8 @@ class ObjectDetection:
 
             cv2.imshow('Camera', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                print(__name__)
                 break
-
-            if cv2.waitKey(1) & 0xFF == ord('s'):
-                text = self.ocr_infer(self.frame_buffer[-1])
-                print("OCR Result:", text)
-
 
         cap.release()
         cv2.destroyAllWindows()

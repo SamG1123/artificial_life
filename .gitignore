@@ -1,3 +1,5 @@
 venv/
 runs/
 .env
+__pycache__/
+*.pyc
