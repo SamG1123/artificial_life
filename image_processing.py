@@ -8,24 +8,26 @@ import os
 from groq import Groq
 import base64
 from transformers import pipeline, AutoTokenizer, AutoModel
+from threading import Thread, Event
 from dotenv import load_dotenv
 load_dotenv()
 
 class ObjectDetection:
     def __init__(self):
-        self.model = YOLO("yolo26n.pt")
+        self.model = YOLO("yolo26n.pt", verbose=False)
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.frame_buffer = []
+
     
     def model_train(self, dataset : str, model_save_path : str):
         self.model.train(data=dataset, epochs=100, imgsz=640, save_path=model_save_path)
     
     def model_infer(self, image_path : str):
-        results = self.model.predict(source=image_path, conf=0.85, save=True, save_txt=True)
+        results = self.model.predict(source=image_path, conf=0.4, verbose=False)
         return results
     
     def get_labels(self, frame):
-        results = self.model.predict(source=frame, conf=0.4)
+        results = self.model.predict(source=frame, conf=0.4, verbose=False)
         box = results[0].boxes
         class_label = results[0].names
         labels = []
@@ -36,7 +38,7 @@ class ObjectDetection:
         return labels
 
     def get_boxes(self, frame):
-        results = self.model.predict(source=frame, conf=0.4)
+        results = self.model.predict(source=frame, conf=0.4, verbose=False)
         box = results[0].boxes
         boxes = []
         for b in box:
@@ -77,9 +79,9 @@ class ObjectDetection:
     def speech_command_infer(self, text : str):
         self.set_command = text.lower()
 
-    def camera_infer(self):
+    def camera_infer(self, stop_event):
         cap = cv2.VideoCapture(0)
-        while True:
+        while not stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
                 break
@@ -93,12 +95,8 @@ class ObjectDetection:
 
             cv2.imshow('Camera', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                stop_event.set()
                 break
-
-            if cv2.waitKey(1) & 0xFF == ord('s'):
-                text = self.ocr_infer(self.frame_buffer[-1])
-                print("OCR Result:", text)
-
 
         cap.release()
         cv2.destroyAllWindows()
