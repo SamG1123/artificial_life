@@ -34,7 +34,11 @@ class LanguageProcessor:
         similarity = doc1.similarity(doc2)
         return similarity
     
+    def generate_response(self, prompt: str):
+        response = f"Response to: {prompt}"
+        return response
 
 if __name__ == "__main__":
     processor = LanguageProcessor()
     print(processor.similarity_score("Scan this Image","Scan this object"))
+    print(processor.generate_response("Scan this Image"))

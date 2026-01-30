@@ -3,6 +3,7 @@ import pyttsx3
 import language_processing as lp
 import image_processing as ip
 from threading import Thread, Event
+from config import global_command_queue
 
 class SpeechSupport:
     def __init__(self):
@@ -11,6 +12,9 @@ class SpeechSupport:
         self.engine = pyttsx3.init()
         self.language_processor = lp.LanguageProcessor()
         self.image_processor = ip.ObjectDetection()
+        self.wake_word = "hello assistant"
+        self.sleep_word = "sleep"
+        self.sleep = True
 
     
     def listen(self, stop_event: Event):
@@ -22,13 +26,27 @@ class SpeechSupport:
                 except r.WaitTimeoutError:
                     continue
             try:
-                command = self.recognizer.recognize_google(audio)
-                print(f"Recognized command: {command}")
-                if command.lower() == "stop":
-                    stop_event.set()
-                    break
+                while self.sleep:
+                    command = self.recognizer.recognize_google(audio)
+                    print(f"Recognized command: {command}")
 
-                #self.process_command(command)
+                    if self.wake_word in command.lower():
+                        self.sleep = False
+                
+                if not self.sleep:
+                    command = self.recognizer.recognize_google(audio)
+                    print(f"Processing command: {command}")
+                    if command.lower() == "stop":
+                        stop_event.set()
+                        break
+
+                    if self.sleep_word in command.lower():
+                        self.sleep = True
+                        continue
+                    
+                    self.process_command(command)
+                    
+
             except r.UnknownValueError:
                 print("Could not understand audio")
             except r.RequestError as e:
@@ -37,5 +55,8 @@ class SpeechSupport:
     def process_command(self, command: str):
         response = self.language_processor.generate_response(command)
         print(f"Response: {response}")
-        self.speak(response)
-            
+        if not global_command_queue.full():
+            global_command_queue.put(response)
+        else:
+            pass  # Optionally handle full queue case
+    
