@@ -1,4 +1,5 @@
 import pyttsx3
+from queue import Empty
 from threading import Thread, Event
 from config import global_command_queue
 
@@ -10,10 +11,12 @@ class TextToSpeech:
     
     def text_to_speech_loop(self, stop_event: Event):
         while not stop_event.is_set():
-            if not global_command_queue.empty():
-                text = global_command_queue.get()
-                self.speak(text)
-                global_command_queue.task_done()
+            try:
+                text = global_command_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            self.speak(text)
+            global_command_queue.task_done()
 
     def speak(self, text: str):
         self.engine.say(text)
