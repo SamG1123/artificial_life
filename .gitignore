@@ -3,3 +3,9 @@ runs/
 .env
 __pycache__/
 *.pyc
+dataset.py
+intent_dataset.csv
+train_intent.py
+intent_model/
+intent_dataset_3000.csv
+temp.py
