@@ -1,5 +1,5 @@
 from playwright.sync_api import sync_playwright
-
+import pyautogui as pag
 
 class BrowserController:
     def __init__(self):
