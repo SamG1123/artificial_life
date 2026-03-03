@@ -53,10 +53,9 @@ class SpeechSupport:
                 print(f"Could not request results; {e}")
     
     def process_command(self, command: str):
-        response = self.language_processor.generate_response(command)
-        print(f"Response: {response}")
-        if not global_command_queue.full():
+        """Route the command through intent classification and put the response on the TTS queue."""
+        response = self.language_processor.process_text(command)
+        print(f"[SpeechSupport] Response: {response}")
+        if response and not global_command_queue.full():
             global_command_queue.put(response)
-        else:
-            pass  # Optionally handle full queue case
     

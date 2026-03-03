@@ -3,15 +3,18 @@ import spacy
 import textblob as tb
 from transformers import pipeline
 from image_processing import ObjectDetection
+from config import global_command_queue, global_goal_queue
 
 class LanguageProcessor:
     def __init__(self):
         self.vision = ObjectDetection()
         self.classifier = pipeline("text-classification", model="./intent_model")
 
-    def classify_intent(self, text: str):
+    def classify_intent(self, text: str) -> str:
+        """Return the intent label string, e.g. 'PC_CONTROL', 'CHAT', 'VISION_QUERY'."""
         result = self.classifier(text)
-        return result
+        # pipeline returns [{"label": "PC_CONTROL", "score": 0.99}]
+        return result[0]["label"]
     
     def classify_entity(self, text: str):
         pass
@@ -48,22 +51,37 @@ class LanguageProcessor:
         response = f"Response to: {prompt}"
         return response
     
-    def process_text(self, text: str):
+    def process_text(self, text: str) -> str:
+        """Classify intent and route the command accordingly.
+        
+        Returns a response string (for TTS) describing what happened.
+        """
         intent = self.classify_intent(text)
-        entities = self.classify_entity(text)
-        sentiment = self.sentiment_analysis(text)
+        print(f"[LanguageProcessor] Intent: {intent} | Text: {text}")
 
-
-        if intent == 'CHAT':
+        if intent == "CHAT":
             response = self.generate_response(text)
-        
-        elif intent == 'PC_CONTROL':
-            steps = self.plan_task(text)
-            response = "Executing PC control command."
-        
-        elif intent == 'VISION_QUERY':
-            self.vision.ocr_infer(None)
-            response = "Processing vision query."
+            return response
+
+        elif intent == "PC_CONTROL":
+            # Put the raw command on the goal queue for the executor thread
+            if not global_goal_queue.full():
+                global_goal_queue.put(text)
+                return f"Got it, executing: {text}"
+            else:
+                return "I'm busy with another task, please wait."
+
+        elif intent == "VISION_QUERY":
+            # Use the latest camera frame for the vision query
+            if self.vision.frame_buffer:
+                frame = self.vision.frame_buffer[-1]
+                answer = self.vision.ocr_infer(frame, query=text)
+                return answer
+            else:
+                return "I can't see anything right now."
+
+        else:
+            return "I'm not sure how to handle that."
 
     
 
