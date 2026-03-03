@@ -1,5 +1,5 @@
 from playwright.sync_api import sync_playwright
-
+import pyautogui as pag
 
 class BrowserController:
     def __init__(self):
@@ -36,15 +36,6 @@ class BrowserController:
     
     def search(self, query: str):
         self.page.goto("https://www.google.com", wait_until="domcontentloaded")
-        self.page.wait_for_timeout(3000)
-        
-        # Check if reCAPTCHA is present and wait for it to be solved
-        try:
-            self.page.wait_for_selector("iframe[title='recaptcha']", timeout=2000)
-            print("reCAPTCHA detected - waiting 10 seconds for manual solving...")
-            self.page.wait_for_timeout(10000)
-        except:
-            pass
         
         # Try multiple selectors for the search box
         try:
@@ -58,7 +49,7 @@ class BrowserController:
                 self.page.fill("input[name='q']", query)
         
         self.page.keyboard.press("Enter")
-        self.page.wait_for_timeout(2000)
+        self.page.wait_for_load_state("domcontentloaded")
     
     def click(self):
         self.page.wait_for_selector("h3")

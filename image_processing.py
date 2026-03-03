@@ -45,9 +45,15 @@ class ObjectDetection:
             x1, y1, x2, y2 = map(int, b.xyxy[0])
             boxes.append((x1, y1, x2, y2))
         return boxes
+    
+    def screenshot_infer(self, screenshot, query : str = "extract elements from the image"):
+        image = np.array(screenshot)
+        elements = self.ocr_infer(image, query=query)
+        return elements
+        
 
     
-    def ocr_infer(self, image):
+    def ocr_infer(self, image, query: str = "Extract text from the image"):
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         buffered = BytesIO()
         pil_image.save(buffered, format="JPEG")
@@ -60,7 +66,7 @@ class ObjectDetection:
                     "content": [
                         {
                             "type": "text",
-                            "text": "Extract text from the following image:"
+                            "text": f"{query}:"
                         },
                         {
                             "type": "image_url",
