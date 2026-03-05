@@ -9,3 +9,4 @@ train_intent.py
 intent_model/
 intent_dataset_3000.csv
 temp.py
+*.csv

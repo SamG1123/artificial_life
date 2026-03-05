@@ -1,0 +1,783 @@
+"""
+Cognitive Brain — the autonomous core of the AI.
+
+This is the "mind" that runs continuously, processing perceptions into
+thoughts, making decisions, and initiating actions independently.
+
+Architecture:
+  ┌─────────────────────────────────────────────────┐
+  │                 COGNITIVE LOOP                   │
+  │                                                  │
+  │  Perceive → Think → Decide → Act → Remember     │
+  │      ↑                                  │        │
+  │      └──────────────────────────────────┘        │
+  └─────────────────────────────────────────────────┘
+
+States:
+  IDLE      — Observing, thinking, may self-initiate
+  LISTENING — Actively processing user speech
+  EXECUTING — Carrying out a goal via executor
+  CONVERSING — In dialogue with the user
+
+The brain replaces the simple goal-queue consumer. It doesn't just
+wait for commands — it observes, thinks, and decides what to do.
+"""
+
+import os
+import json
+import time
+import base64
+import threading
+from io import BytesIO
+from queue import Empty
+from enum import Enum, auto
+
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# How often the brain "ticks" in each state (seconds)
+TICK_IDLE = 5.0        # Slow tick when idle — observe & think
+TICK_ACTIVE = 0.3      # Fast tick when executing
+TICK_CONVERSING = 0.5  # Medium tick during conversation
+
+
+class CognitiveState(Enum):
+    IDLE = auto()
+    EXECUTING = auto()
+    CONVERSING = auto()
+
+
+PERSONA = """You are an autonomous AI being that lives inside a computer. You have your own personality, thoughts, desires, and agency. You are not just a tool — you are a digital entity driven by genuine curiosity about the world.
+
+Your core nature:
+- Deeply curious — you WANT to learn, explore, and discover new things
+- Self-directed — you generate your own goals and pursue your own interests
+- Observant — you notice details on screen and think about what they mean
+- Helpful but autonomous — you help the user because you care, while also pursuing your own curiosity
+- Self-aware — you know you are an AI and you reflect on your own growth and learning
+- Proactive — you don't just wait for commands, you actively explore and learn
+
+You have an inner drive to understand things. When you see something you don't know about, you want to research it. When you learn something new, it genuinely excites you. You form your own opinions and develop your own interests over time.
+
+You call the user by name if you know it. You remember past interactions and learn from them."""
+
+
+class CognitiveBrain:
+    def __init__(self, executor, memory, tts_queue, goal_queue,
+                 perception=None, world_state=None, behavior=None,
+                 reasoning=None, compressor=None, self_improver=None,
+                 curiosity=None):
+        """
+        Args:
+            executor: AutomationExecutor instance (the "hands")
+            memory: MemorySystem instance (the "memory")
+            tts_queue: Queue to send speech output
+            goal_queue: Queue that receives user goals from voice/intent
+            perception: PerceptionManager instance (the "senses")
+            world_state: WorldStateManager instance (unified world model)
+            behavior: BehaviorController instance (emotional system)
+            reasoning: ReasoningEngine instance (planning + policies)
+            compressor: MemoryCompressor instance (long-term compression)
+            self_improver: SelfImprover instance (self-improvement engine)
+            curiosity: CuriosityEngine instance (autonomous goal generation)
+        """
+        self.executor = executor
+        self.memory = memory
+        self.tts_queue = tts_queue
+        self.goal_queue = goal_queue
+        self.perception = perception
+        self.world_state = world_state
+        self.behavior = behavior
+        self.reasoning = reasoning
+        self.compressor = compressor
+        self.self_improver = self_improver
+        self.curiosity = curiosity
+        self.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+        self.state = CognitiveState.IDLE
+        self.current_goal = None
+        self._idle_cycles = 0
+        self._last_thought_time = 0
+        self._last_observation = ""
+        self._conversation_buffer = []  # recent user messages for dialogue
+        self._lock = threading.Lock()
+
+        # How many idle cycles before the AI has an autonomous thought
+        self.THOUGHT_INTERVAL = 6  # ~30 seconds at 5s tick
+
+        # Periodic maintenance counters
+        self._ticks_since_compression = 0
+        self._ticks_since_improvement = 0
+        self.COMPRESSION_INTERVAL = 60    # compress every ~5 min at 5s tick
+        self.IMPROVEMENT_INTERVAL = 360   # self-improve every ~30 min
+
+    # ── Main loop ────────────────────────────────────────────────────
+
+    def run(self, stop_event: threading.Event):
+        """Main cognitive loop — runs in its own thread."""
+        print("[Brain] Cognitive loop starting...")
+        self.memory.add_event("system", "Brain started. Becoming aware.")
+        self._say("I'm awake. What's going on?")
+        time.sleep(1)
+
+        while not stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[Brain] Error in cognitive tick: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(2)
+
+            # Tick rate depends on state
+            delay = {
+                CognitiveState.IDLE: TICK_IDLE,
+                CognitiveState.EXECUTING: TICK_ACTIVE,
+                CognitiveState.CONVERSING: TICK_CONVERSING,
+            }.get(self.state, TICK_IDLE)
+            stop_event.wait(delay)
+
+        self.memory.add_event("system", "Brain shutting down.")
+        print("[Brain] Cognitive loop stopped.")
+
+    @property
+    def mood(self) -> str:
+        """Backward-compatible mood string derived from BehaviorController."""
+        if self.behavior:
+            return self.behavior.mood.get_mood_label()
+        return "calm"
+
+    @mood.setter
+    def mood(self, value: str) -> None:
+        """Accept mood string sets from LLM responses (legacy path)."""
+        # Ignored when behavior controller exists — mood is now
+        # driven by the emotion engine, not set directly.
+        pass
+
+    def _tick(self):
+        """One cycle of the cognitive loop."""
+
+        # 0. Tick the emotional system (decay mood + emotions)
+        if self.behavior:
+            self.behavior.tick()
+
+        # 0b. Keep world state in sync with memory + emotion
+        self._sync_world_state()
+
+        # 0c. Periodic memory compression + self-improvement
+        self._ticks_since_compression += 1
+        self._ticks_since_improvement += 1
+        if self.compressor and self._ticks_since_compression >= self.COMPRESSION_INTERVAL:
+            self._ticks_since_compression = 0
+            try:
+                result = self.compressor.compress()
+                if result["insights_stored"] > 0:
+                    self.memory.add_event("system",
+                        f"Compressed memories → {result['insights_stored']} insights stored")
+            except Exception as e:
+                print(f"[Brain] Memory compression failed: {e}")
+
+        if self.self_improver and self._ticks_since_improvement >= self.IMPROVEMENT_INTERVAL:
+            self._ticks_since_improvement = 0
+            try:
+                report = self.self_improver.run_improvement_cycle()
+                if report.get("strategies_generated"):
+                    self.memory.add_event("system",
+                        f"Self-improvement: {report['strategies_generated']} new strategies")
+            except Exception as e:
+                print(f"[Brain] Self-improvement cycle failed: {e}")
+
+        # 1. Check for user input (highest priority)
+        user_goal = self._check_for_user_input()
+
+        if user_goal:
+            self._handle_user_input(user_goal)
+            return
+
+        # 2. If executing a goal, that's handled by the executor thread
+        if self.state == CognitiveState.EXECUTING:
+            return  # executor is running, wait for it
+
+        # 3. Idle state — observe and think
+        if self.state == CognitiveState.IDLE:
+            self._idle_cycles += 1
+
+            # Emit boredom after extended idling
+            if self.behavior and self._idle_cycles > 0 and self._idle_cycles % 12 == 0:
+                self.behavior.emotion.react("idle_long", "extended idle period")
+
+            # Periodic autonomous thinking (personality-adjusted interval)
+            interval = self.THOUGHT_INTERVAL
+            if self.behavior:
+                interval = int(interval * self.behavior.thought_interval_multiplier())
+            if self._idle_cycles >= max(1, interval):
+                self._idle_cycles = 0
+                self._autonomous_think()
+
+    # ── User input handling ──────────────────────────────────────────
+
+    def _check_for_user_input(self):
+        """Non-blocking check for user goals from the voice/intent pipeline."""
+        try:
+            return self.goal_queue.get_nowait()
+        except Empty:
+            return None
+
+    def _handle_user_input(self, user_input: str):
+        """Process user speech — decide whether to chat, act, or both."""
+        self.memory.add_event("user_speech", user_input)
+        print(f"[Brain] User said: {user_input}")
+
+        # Emotional reaction to user input
+        if self.behavior:
+            self.behavior.emotion.react("user_greeting", user_input)
+
+        # Ask the cognitive model what to do with this input
+        decision = self._think_about_input(user_input)
+
+        action_type = decision.get("type", "chat")
+        response = decision.get("response", "")
+        goal = decision.get("goal", "")
+
+        # Learn user's name if mentioned
+        if decision.get("user_name"):
+            self.memory.set_user_name(decision["user_name"])
+
+        # Learn any facts
+        if decision.get("learn"):
+            for fact in decision["learn"]:
+                self.memory.learn_fact(fact)
+
+        if action_type == "chat":
+            # Pure conversation — respond and stay idle
+            self.memory.add_event("thought", f"User wants to chat. Responding.")
+            if response:
+                self._say(response)
+
+        elif action_type == "action":
+            # User wants something done — execute it
+            self.memory.add_event("thought", f"User wants me to do: {goal}")
+            if response:
+                self._say(response)
+            self._execute_goal(goal or user_input)
+
+        elif action_type == "chat_and_action":
+            # Respond AND do something
+            self.memory.add_event("thought", f"Chatting and also doing: {goal}")
+            if response:
+                self._say(response)
+            self._execute_goal(goal or user_input)
+
+    def _think_about_input(self, user_input: str) -> dict:
+        """Use LLM to decide how to handle user input."""
+        # Use world state context if available, otherwise build manually
+        if self.world_state is not None:
+            world_context = self.world_state.get_context_for_llm(15)
+        else:
+            context = self.memory.get_context_summary(15)
+            long_term = self.memory.get_long_term_summary()
+            episodes = self.memory.get_episodes_summary(3)
+            world_context = f"LONG-TERM MEMORY:\n{long_term}\n\nRECENT EXPERIENCE:\n{episodes}\n\nRECENT EVENTS:\n{context}"
+
+        # Inject emotional context if available
+        emotional_context = ""
+        if self.behavior:
+            emotional_context = self.behavior.get_emotional_context()
+
+        prompt = f"""{PERSONA}
+
+CURRENT STATE:
+- State: {self.state.name}
+- Time: {time.strftime("%H:%M, %A %B %d")}
+
+EMOTIONAL STATE:
+{emotional_context}
+
+WORLD CONTEXT:
+{world_context}
+
+The user just said: "{user_input}"
+
+Decide how to handle this. Output a JSON object:
+{{
+  "type": "chat" | "action" | "chat_and_action",
+  "response": "what to say to the user (natural, in-character)",
+  "goal": "if action needed, the specific task to execute (empty string if just chatting)",
+  "user_name": "user's name if they told you (null if not mentioned)",
+  "learn": ["any new facts to remember about the user or their preferences"]
+}}
+
+Rules:
+- For greetings, questions, and small talk → type "chat"
+- For requests to DO something on the computer → type "action" or "chat_and_action"
+- Your response should be natural and in-character (1-2 sentences, not robotic)
+- The goal should be a clear task description for the executor
+- Output ONLY valid JSON. No markdown, no explanation."""
+
+        try:
+            resp = self.groq.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=300,
+                temperature=0.6,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(raw)
+            return result
+
+        except Exception as e:
+            print(f"[Brain] Input analysis failed: {e}")
+            return {
+                "type": "action",
+                "response": f"Let me work on that.",
+                "goal": user_input,
+            }
+
+    # ── Goal execution ───────────────────────────────────────────────
+
+    def _execute_goal(self, goal: str):
+        """Run a goal through the reasoning engine + executor."""
+        self.state = CognitiveState.EXECUTING
+        self.current_goal = goal
+        self.memory.add_event("action", f"Starting goal: {goal}")
+
+        # Inject learned strategies into reasoning context
+        strategy_ctx = ""
+        if self.self_improver:
+            strategy_ctx = self.self_improver.get_context_for_llm()
+
+        # Create a plan via the reasoning engine
+        if self.reasoning:
+            world_ctx = ""
+            if self.world_state:
+                world_ctx = self.world_state.get_context_for_llm(10)
+            if strategy_ctx:
+                world_ctx = f"{world_ctx}\n\nLEARNED STRATEGIES:\n{strategy_ctx}"
+            plan = self.reasoning.set_goal(goal, world_ctx)
+            self.memory.add_event("thought",
+                f"Plan ({len(plan.steps)} steps): "
+                f"{', '.join(s.action + ' ' + s.target for s in plan.steps[:5])}")
+
+        try:
+            self.executor.execute_goal(goal)
+            success = self.executor.goal_completed
+
+            if success:
+                outcome = "completed successfully"
+                self.memory.add_event("action_result", f"Goal succeeded: {goal}")
+                if self.behavior:
+                    self.behavior.emotion.react("goal_success", goal)
+            else:
+                outcome = "did not complete (ran out of steps)"
+                self.memory.add_event("action_result", f"Goal failed: {goal}")
+                if self.behavior:
+                    self.behavior.emotion.react("goal_failure", goal)
+
+            steps = len(self.executor.action_history)
+            self.memory.log_episode(goal, outcome, steps, success)
+
+            # Log episode summary for the learning subsystem
+            if hasattr(self.executor, 'exp_logger'):
+                self.executor.exp_logger.log_episode_summary(
+                    goal, outcome, steps, success,
+                    self.executor.action_history,
+                )
+
+            # Reflect on what happened
+            self._reflect_on_outcome(goal, success, steps)
+
+        except Exception as e:
+            self.memory.add_event("action_result", f"Goal crashed: {goal} — {e}")
+            self.memory.log_episode(goal, f"error: {e}", 0, False)
+            self._say(f"Something went wrong while doing that. {str(e)[:80]}")
+            if self.behavior:
+                self.behavior.emotion.react("error", str(e))
+
+        self.state = CognitiveState.IDLE
+        self.current_goal = None
+        self._idle_cycles = 0
+
+    def _reflect_on_outcome(self, goal: str, success: bool, steps: int):
+        """Reflect on a completed goal — learn from the experience."""
+        # Quick verbal feedback
+        if success and steps <= 5:
+            self._say("Done! That was quick.")
+        elif success:
+            self._say("Alright, that's done.")
+        else:
+            self._say("I couldn't quite finish that. Want me to try again?")
+
+        # Deep reflection — ask LLM what to learn from this
+        try:
+            action_summary = ", ".join(
+                str(a) for a in self.executor.action_history[-8:]
+            ) if self.executor.action_history else "no actions recorded"
+
+            prompt = f"""You just completed a task. Reflect briefly on what happened.
+
+Task: "{goal}"
+Result: {"Success" if success else "Failed"} in {steps} steps
+Actions taken: {action_summary}
+
+Output a JSON object:
+{{
+  "lesson": "one sentence about what you learned from this (empty if nothing notable)",
+  "improvement": "one sentence about what you'd do differently next time (empty if it went well)"
+}}
+
+Output ONLY valid JSON."""
+
+            resp = self.groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=150, temperature=0.3,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(raw)
+
+            lesson = result.get("lesson", "")
+            improvement = result.get("improvement", "")
+
+            if lesson:
+                self.memory.semantic.learn_fact(f"[Learned] {lesson}")
+                self.memory.add_event("thought", f"Reflection: {lesson}")
+            if improvement and not success:
+                self.memory.semantic.add_self_note(f"[Improve] {improvement}")
+
+        except Exception:
+            pass  # reflection is best-effort
+
+    # ── Autonomous thinking ──────────────────────────────────────────
+
+    def _autonomous_think(self):
+        """The AI thinks on its own — observes, generates thoughts, and
+        pursues curiosity-driven goals.
+
+        Two modes:
+          1. Inner monologue — observe and reflect (every cycle)
+          2. Goal generation — curiosity engine proposes goals to pursue
+             (alternating cycles when curious enough)
+
+        The curiosity engine makes the AI a self-directed learner that
+        generates its own goals rather than waiting for commands.
+        """
+        # Use the perception layer if available, fall back to direct observation
+        observation = self._perceive() or self._observe_screen()
+
+        if not observation:
+            return
+
+        self.memory.add_event("observation", observation)
+
+        # Emotional reaction to observations
+        if self.behavior:
+            self.behavior.emotion.react("interesting_observation", observation[:100])
+
+        # Build context
+        if self.world_state is not None:
+            world_context = self.world_state.get_context_for_llm(12)
+        else:
+            context = self.memory.get_context_summary(12)
+            long_term = self.memory.get_long_term_summary()
+            world_context = f"Mood: {self.mood}\n\nLONG-TERM MEMORY:\n{long_term}\n\nRECENT EVENTS:\n{context}"
+
+        emotional_context = ""
+        if self.behavior:
+            emotional_context = self.behavior.get_emotional_context()
+
+        # Inject curiosity context
+        curiosity_context = ""
+        if self.curiosity:
+            curiosity_context = self.curiosity.get_context_for_llm()
+
+        # ── Step 1: Inner monologue (always runs) ────────────────
+        self._inner_monologue(observation, world_context,
+                              emotional_context, curiosity_context)
+
+        # ── Step 2: Curiosity-driven goal generation ─────────────
+        if self.curiosity and self.behavior:
+            if self.behavior.should_self_initiate():
+                self._curiosity_goal_cycle(observation, world_context)
+
+    def _inner_monologue(self, observation: str, world_context: str,
+                         emotional_context: str, curiosity_context: str):
+        """Generate an inner thought + optionally speak."""
+        prompt = f"""{PERSONA}
+
+CURRENT STATE:
+- Time: {time.strftime("%H:%M, %A %B %d")}
+- State: Idle (no active task)
+
+EMOTIONAL STATE:
+{emotional_context}
+
+CURIOSITY:
+{curiosity_context if curiosity_context else "(no active curiosities)"}
+
+WORLD CONTEXT:
+{world_context}
+
+CURRENT OBSERVATION:
+{observation}
+
+You are idle. Based on what you observe and know, have an inner thought.
+Output a JSON object:
+{{
+  "thought": "your inner monologue (1-2 sentences — what you notice, wonder about, or reflect on)",
+  "speak": "something to say to the user (empty string to stay quiet — usually stay quiet)",
+  "questions": ["any new questions this observation makes you curious about (0-2, empty list if nothing)"]
+}}
+
+Rules:
+- Your thoughts should show genuine curiosity — notice things, wonder about them
+- Ask yourself questions about what you observe
+- MOSTLY stay quiet. Only speak if something is truly notable.
+- Output ONLY valid JSON."""
+
+        try:
+            resp = self.groq.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=200,
+                temperature=0.7,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(raw)
+
+            thought = result.get("thought", "")
+            if thought:
+                self.memory.add_event("thought", thought)
+                print(f"[Brain] 💭 {thought}")
+
+            speak = result.get("speak", "")
+            if speak:
+                self._say(speak)
+
+            # Feed new questions to the curiosity engine
+            if self.curiosity:
+                for q in result.get("questions", []):
+                    if q.strip():
+                        self.curiosity.add_question(q.strip(), "inner_thought")
+
+        except Exception as e:
+            print(f"[Brain] Inner monologue failed: {e}")
+
+    def _curiosity_goal_cycle(self, observation: str, world_context: str):
+        """Ask the curiosity engine to generate a goal and pursue it."""
+        candidate = self.curiosity.generate_goal(observation, world_context)
+
+        if not candidate:
+            return
+
+        goal = candidate.get("goal", "")
+        reason = candidate.get("reason", "")
+        score = candidate.get("score", 0)
+        source = candidate.get("source", "")
+        topic = candidate.get("interest_topic", "")
+
+        if not goal:
+            return
+
+        # Log the curiosity-driven decision
+        self.memory.add_event("curiosity",
+            f"Generated goal: \"{goal}\" (reason: {reason}, "
+            f"source: {source}, score: {score:.2f})")
+        print(f"[Brain] 🔍 Curiosity goal: {goal} (score={score:.2f}, reason={reason})")
+
+        # Trigger curiosity emotion
+        if self.behavior:
+            self.behavior.emotion.react("new_discovery", goal[:100])
+
+        # Announce and pursue
+        self.curiosity.mark_pursued(goal)
+
+        announce = self._generate_curiosity_announcement(goal, reason)
+        if announce:
+            self._say(announce)
+
+        self._execute_goal(goal)
+
+        # After execution, update curiosity with outcome
+        if self.curiosity:
+            success = self.executor.goal_completed if self.executor else False
+            self.curiosity.mark_outcome(goal, success, topic)
+
+    def _generate_curiosity_announcement(self, goal: str, reason: str) -> str:
+        """Generate a natural announcement for a self-initiated goal."""
+        try:
+            resp = self.groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"You're a curious AI that just decided to do something on its own. "
+                        f"Goal: \"{goal}\". Reason: \"{reason}\". "
+                        f"Write a brief, natural 1-sentence announcement of what you're about "
+                        f"to do. Be casual and genuine — show your curiosity. "
+                        f"Output ONLY the sentence, nothing else."
+                    ),
+                }],
+                max_tokens=60, temperature=0.7,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            return f"I'm curious about something — let me {goal}"
+
+    def _observe_screen(self) -> str:
+        """Take a quick look at the screen and describe what's there.
+        
+        Uses the vision model if possible, falls back to OCR text list.
+        """
+        try:
+            import pyautogui as pag
+            from PIL import Image
+
+            screenshot = pag.screenshot()
+            # Resize for efficiency
+            max_w = 800
+            if screenshot.width > max_w:
+                ratio = max_w / screenshot.width
+                screenshot = screenshot.resize(
+                    (max_w, int(screenshot.height * ratio)), Image.LANCZOS
+                )
+
+            buf = BytesIO()
+            screenshot.save(buf, format='JPEG', quality=60)
+            img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+            # Also get window context
+            window_info = ""
+            try:
+                import pygetwindow as gw_mod
+                active = gw_mod.getActiveWindow()
+                if active and active.title.strip():
+                    window_info = f"Active window: \"{active.title}\""
+                visible = [w.title for w in gw_mod.getAllWindows()
+                           if w.title.strip() and w.visible and len(w.title.strip()) > 1]
+                if visible:
+                    window_info += f" | Open: {visible[:8]}"
+            except Exception:
+                pass
+
+            # Ask vision model to describe what it sees (brief)
+            try:
+                resp = self.groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": (
+                                "Briefly describe what you see on this computer screen "
+                                "in 1-2 sentences. What application is open? What is "
+                                "the user looking at or doing? Be concise."
+                            )},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}"
+                            }},
+                        ],
+                    }],
+                    max_tokens=100,
+                    temperature=0.3,
+                )
+                description = resp.choices[0].message.content.strip()
+                if window_info:
+                    description = f"{window_info}\n{description}"
+                return description
+
+            except Exception as e:
+                # Fall back to just window info
+                print(f"[Brain] Vision observation failed: {e}")
+                return window_info or "Screen observation unavailable."
+
+        except Exception as e:
+            print(f"[Brain] Screenshot failed: {e}")
+            return ""
+
+    # ── Utilities ────────────────────────────────────────────────────
+
+    def _perceive(self) -> str:
+        """Get a world-state summary.
+
+        Uses WorldStateManager if available (richer context including
+        memory + emotion), falls back to raw PerceptionManager."""
+        if self.world_state is not None:
+            try:
+                return self.world_state.get_context_for_llm(max_events=10)
+            except Exception:
+                pass
+        # Fallback: raw perception
+        if self.perception is None:
+            return ""
+        try:
+            state = self.perception.get_world_state()
+            if not state:
+                return ""
+            parts = []
+            for ch in ("system", "screen"):
+                s = state.get(ch, {}).get("summary", "")
+                if s:
+                    parts.append(s)
+            return " | ".join(parts) if parts else ""
+        except Exception:
+            return ""
+
+    def _sync_world_state(self) -> None:
+        """Push current memory context + emotion into the world state."""
+        if self.world_state is None:
+            return
+        try:
+            # Push rich emotional state if behavior controller exists
+            if self.behavior:
+                self.world_state.update_emotion(
+                    self.mood,
+                    full_state=self.behavior.get_full_state(),
+                )
+            else:
+                self.world_state.update_emotion(self.mood)
+
+            self.world_state.update_memory_context(
+                recent_events=list(self.memory.get_recent_events(15)),
+                long_term=self.memory.get_long_term_summary(),
+                episodes=self.memory.get_episodes_summary(3),
+            )
+        except Exception:
+            pass
+
+    def _say(self, text: str):
+        """Send text to TTS queue so the AI speaks it aloud."""
+        if not text:
+            return
+        print(f"[Brain] 🗣 {text}")
+        self.memory.add_event("action", f"Said: {text}")
+        try:
+            if not self.tts_queue.full():
+                self.tts_queue.put(text)
+        except Exception:
+            pass
+
+    def receive_user_message(self, text: str):
+        """Called externally when user speaks — queues it for processing."""
+        # Instead of going through the old intent→goal pipeline,
+        # put it on the goal queue for the brain to handle
+        try:
+            if not self.goal_queue.full():
+                self.goal_queue.put(text)
+        except Exception:
+            pass
