@@ -44,6 +44,7 @@ Subsystem layers (initialised in order):
 import signal
 import threading
 import time
+from datetime import datetime
 from threading import Thread, Event
 
 import image_processing
@@ -57,8 +58,9 @@ from perception import PerceptionManager
 from world_state import WorldStateManager
 from emotion import PersonalityModel, MoodEngine, EmotionEngine, BehaviorController
 from reasoning import ReasoningEngine
-from learning import ExperienceLogger, DatasetBuilder, ModelTrainer, SelfImprover
+from learning import ExperienceLogger, DatasetBuilder, ModelTrainer, SelfImprover, SkillGraph, NightlyTrainer
 from curiosity import CuriosityEngine
+from cognition import AttentionSystem, DreamEngine
 from config import global_goal_queue, global_command_queue
 
 
@@ -100,7 +102,9 @@ class AgentController:
         )
 
         # ── Layer 5 — Reasoning ──────────────────────────────────
-        self.reasoning = ReasoningEngine(behavior=self.behavior)
+        self.reasoning = ReasoningEngine(
+            behavior=self.behavior, store_dir=store_dir,
+        )
 
         # ── Layer 6 — Learning ───────────────────────────────────
         self.exp_logger = ExperienceLogger(store_dir=store_dir)
@@ -124,6 +128,27 @@ class AgentController:
             store_dir=store_dir,
         )
 
+        # ── Layer 6d — Skill Graph (capability tracking) ─────────
+        self.skill_graph = SkillGraph(store_dir=store_dir)
+
+        # ── Layer 6e — Attention (cognitive focus management) ─────
+        self.attention = AttentionSystem(store_dir=store_dir)
+
+        # ── Layer 6f — Dreaming (experience-based memory consolidation) ──
+        self.dream_engine = DreamEngine(
+            memory=self.memory,
+            behavior=self.behavior,
+            store_dir=store_dir,
+        )
+
+        # ── Layer 6g — Nightly Training (sleep-time learning pipeline) ──
+        self.nightly_trainer = NightlyTrainer(
+            memory=self.memory,
+            exp_logger=self.exp_logger,
+            self_improver=self.self_improver,
+            store_dir=store_dir,
+        )
+
         # ── Layer 7 — Action ─────────────────────────────────────
         self.executor = AutomationExecutor(
             reasoning_engine=self.reasoning,
@@ -143,6 +168,10 @@ class AgentController:
             compressor=self.compressor,
             self_improver=self.self_improver,
             curiosity=self.curiosity,
+            skill_graph=self.skill_graph,
+            attention=self.attention,
+            dream_engine=self.dream_engine,
+            nightly_trainer=self.nightly_trainer,
         )
 
         # Wire voice input → brain
@@ -205,7 +234,11 @@ class AgentController:
             return
         print("[Agent] Shutting down…")
         self._stop_event.set()
-
+        # Persist scheduled tasks before threads stop
+        try:
+            self.reasoning.planner.scheduler._save()
+        except Exception as e:
+            print(f"[Agent] Failed to persist scheduled tasks: {e}")
         self.perception.shutdown()
 
         for t in self._threads:
@@ -232,12 +265,41 @@ class AgentController:
             "emotion": self.behavior.emotion.dominant_emotion(),
             "personality": self.personality.summary(),
             "memory_events": len(self.memory.get_recent_events(999)),
+            "skill_graph": self.skill_graph.stats(),
+            "attention": self.attention.stats(),
+            "dreaming": self.dream_engine.stats(),
             "threads": {t.name: t.is_alive() for t in self._threads},
         }
 
     def send_message(self, text: str) -> None:
         """Inject a user message into the cognitive loop (programmatic input)."""
         self.brain.receive_user_message(text)
+
+    def schedule_goal(
+        self,
+        goal: str,
+        run_at: float | datetime | str,
+        *,
+        priority: int = 0,
+        recurrence_seconds: float | None = None,
+        world_context: str = "",
+    ) -> dict:
+        """Schedule a goal for future execution by the brain loop."""
+        return self.reasoning.schedule_goal(
+            goal,
+            run_at,
+            world_context=world_context,
+            priority=priority,
+            recurrence_seconds=recurrence_seconds,
+        )
+
+    def list_scheduled_goals(self) -> list[dict]:
+        """Return all pending scheduled goals."""
+        return self.reasoning.list_scheduled_goals()
+
+    def cancel_scheduled_goal(self, task_id: str) -> bool:
+        """Cancel a previously scheduled goal by ID."""
+        return self.reasoning.cancel_scheduled_goal(task_id)
 
     # ── Training entrypoint ──────────────────────────────────────
 
