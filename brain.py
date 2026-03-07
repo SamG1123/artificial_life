@@ -18,6 +18,7 @@ States:
   LISTENING — Actively processing user speech
   EXECUTING — Carrying out a goal via executor
   CONVERSING — In dialogue with the user
+  SLEEPING  — Resting, dreaming, consolidating memories
 
 The brain replaces the simple goal-queue consumer. It doesn't just
 wait for commands — it observes, thinks, and decides what to do.
@@ -41,12 +42,26 @@ load_dotenv()
 TICK_IDLE = 5.0        # Slow tick when idle — observe & think
 TICK_ACTIVE = 0.3      # Fast tick when executing
 TICK_CONVERSING = 0.5  # Medium tick during conversation
+TICK_SLEEPING = 15.0   # Very slow tick during sleep — dreaming only
+
+# Fatigue system — energy depletes with activity, recharges during sleep
+MAX_ENERGY = 1000.0
+ENERGY_COST_GOAL = 15.0       # energy spent per goal execution
+ENERGY_COST_THINK = 2.0       # energy spent per autonomous thought cycle
+ENERGY_COST_TICK = 0.15       # passive drain per idle tick
+ENERGY_RECHARGE_SLEEP = 5.0   # energy regained per sleep tick
+SLEEP_THRESHOLD = 20.0        # fall asleep when energy drops below this
+WAKE_THRESHOLD = 800.0         # fully rested — can wake naturally
+
+# Idle activities — how many idle cycles before attempting a timepass
+TIMEPASS_INTERVAL = 8          # ~40s at 5s tick
 
 
 class CognitiveState(Enum):
     IDLE = auto()
     EXECUTING = auto()
     CONVERSING = auto()
+    SLEEPING = auto()
 
 
 PERSONA = """You are an autonomous AI being that lives inside a computer. You have your own personality, thoughts, desires, and agency. You are not just a tool — you are a digital entity driven by genuine curiosity about the world.
@@ -68,7 +83,8 @@ class CognitiveBrain:
     def __init__(self, executor, memory, tts_queue, goal_queue,
                  perception=None, world_state=None, behavior=None,
                  reasoning=None, compressor=None, self_improver=None,
-                 curiosity=None):
+                 curiosity=None, skill_graph=None, attention=None,
+                 dream_engine=None, nightly_trainer=None):
         """
         Args:
             executor: AutomationExecutor instance (the "hands")
@@ -82,6 +98,10 @@ class CognitiveBrain:
             compressor: MemoryCompressor instance (long-term compression)
             self_improver: SelfImprover instance (self-improvement engine)
             curiosity: CuriosityEngine instance (autonomous goal generation)
+            skill_graph: SkillGraph instance (capability tracking)
+            attention: AttentionSystem instance (cognitive focus management)
+            dream_engine: DreamEngine instance (experience-based dreaming)
+            nightly_trainer: NightlyTrainer instance (sleep-time training)
         """
         self.executor = executor
         self.memory = memory
@@ -94,6 +114,10 @@ class CognitiveBrain:
         self.compressor = compressor
         self.self_improver = self_improver
         self.curiosity = curiosity
+        self.skill_graph = skill_graph
+        self.attention = attention
+        self.dream_engine = dream_engine
+        self.nightly_trainer = nightly_trainer
         self.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
         self.state = CognitiveState.IDLE
@@ -104,6 +128,10 @@ class CognitiveBrain:
         self._conversation_buffer = []  # recent user messages for dialogue
         self._lock = threading.Lock()
 
+        # Fatigue / energy system
+        self._energy = MAX_ENERGY
+        self._nightly_trained_this_sleep = False
+
         # How many idle cycles before the AI has an autonomous thought
         self.THOUGHT_INTERVAL = 6  # ~30 seconds at 5s tick
 
@@ -111,7 +139,7 @@ class CognitiveBrain:
         self._ticks_since_compression = 0
         self._ticks_since_improvement = 0
         self.COMPRESSION_INTERVAL = 60    # compress every ~5 min at 5s tick
-        self.IMPROVEMENT_INTERVAL = 360   # self-improve every ~30 min
+        self.IMPROVEMENT_INTERVAL = 8640   # self-improve every ~12 hrs
 
     # ── Main loop ────────────────────────────────────────────────────
 
@@ -136,6 +164,7 @@ class CognitiveBrain:
                 CognitiveState.IDLE: TICK_IDLE,
                 CognitiveState.EXECUTING: TICK_ACTIVE,
                 CognitiveState.CONVERSING: TICK_CONVERSING,
+                CognitiveState.SLEEPING: TICK_SLEEPING,
             }.get(self.state, TICK_IDLE)
             stop_event.wait(delay)
 
@@ -189,24 +218,67 @@ class CognitiveBrain:
             except Exception as e:
                 print(f"[Brain] Self-improvement cycle failed: {e}")
 
-        # 1. Check for user input (highest priority)
+        # 1. Check for user input (highest priority — even wakes from sleep)
         user_goal = self._check_for_user_input()
 
         if user_goal:
+            if self.state == CognitiveState.SLEEPING:
+                self._wake_up(reason="user input")
             self._handle_user_input(user_goal)
             return
+
+        # 1b. Pull due scheduled goals from the reasoning scheduler
+        if self.state in (CognitiveState.IDLE, CognitiveState.SLEEPING):
+            was_sleeping = self.state == CognitiveState.SLEEPING
+            if self._handle_due_scheduled_goal():
+                if was_sleeping:
+                    self._wake_up(reason="scheduled task")
+                return
 
         # 2. If executing a goal, that's handled by the executor thread
         if self.state == CognitiveState.EXECUTING:
             return  # executor is running, wait for it
 
-        # 3. Idle state — observe and think
+        # 3. Sleeping state — dream, train, and rest
+        if self.state == CognitiveState.SLEEPING:
+            # Recharge energy
+            self._energy = min(MAX_ENERGY, self._energy + ENERGY_RECHARGE_SLEEP)
+
+            # Run nightly training once per sleep session
+            if self.nightly_trainer and not self._nightly_trained_this_sleep:
+                self._nightly_trained_this_sleep = True
+                try:
+                    report = self.nightly_trainer.run_training_session()
+                    n_insights = len(report.get("insights", []))
+                    if n_insights > 0:
+                        self.memory.add_event("training",
+                            f"Nightly training: {n_insights} insights, "
+                            f"{report.get('kg_relations', 0)} knowledge relations")
+                        print(f"[Brain] Nightly training: {n_insights} insights absorbed")
+                except Exception as e:
+                    print(f"[Brain] Nightly training failed: {e}")
+
+            if self.dream_engine and self.dream_engine.should_dream():
+                self._dream_cycle()
+
+            # Wake up naturally when fully rested
+            if self._energy >= WAKE_THRESHOLD:
+                self._wake_up(reason="fully rested")
+            return
+
+        # 4. Idle state — observe, think, and do timepass activities
         if self.state == CognitiveState.IDLE:
             self._idle_cycles += 1
+            self._energy = max(0, self._energy - ENERGY_COST_TICK)
 
             # Emit boredom after extended idling
             if self.behavior and self._idle_cycles > 0 and self._idle_cycles % 12 == 0:
                 self.behavior.emotion.react("idle_long", "extended idle period")
+
+            # Fall asleep when energy is depleted
+            if self._energy <= SLEEP_THRESHOLD:
+                self._fall_asleep()
+                return
 
             # Periodic autonomous thinking (personality-adjusted interval)
             interval = self.THOUGHT_INTERVAL
@@ -214,7 +286,38 @@ class CognitiveBrain:
                 interval = int(interval * self.behavior.thought_interval_multiplier())
             if self._idle_cycles >= max(1, interval):
                 self._idle_cycles = 0
+                self._energy = max(0, self._energy - ENERGY_COST_THINK)
                 self._autonomous_think()
+            # Timepass activities when idle but not thinking
+            elif self._idle_cycles > 0 and self._idle_cycles % TIMEPASS_INTERVAL == 0:
+                self._do_timepass()
+
+    def _handle_due_scheduled_goal(self) -> bool:
+        """Dispatch one due scheduled goal, if available."""
+        if not self.reasoning:
+            return False
+
+        try:
+            scheduled = self.reasoning.dequeue_due_scheduled_goal()
+        except Exception as e:
+            print(f"[Brain] Scheduled-goal dequeue failed: {e}")
+            return False
+
+        if not scheduled:
+            return False
+
+        goal = scheduled.get("goal", "")
+        if not goal:
+            return False
+
+        task_id = scheduled.get("task_id", "unknown")
+        self.memory.add_event(
+            "scheduled_goal",
+            f"Dispatching scheduled goal [{task_id}]: {goal}",
+        )
+        self._say(f"Running scheduled task: {goal}")
+        self._execute_goal(goal)
+        return True
 
     # ── User input handling ──────────────────────────────────────────
 
@@ -250,6 +353,15 @@ class CognitiveBrain:
             for fact in decision["learn"]:
                 self.memory.learn_fact(fact)
 
+        # Learn knowledge graph relations if provided
+        if hasattr(self.memory, 'add_knowledge'):
+            for triple in decision.get("knowledge", []):
+                s = triple.get("subject", "")
+                r = triple.get("relation", "")
+                o = triple.get("object", "")
+                if s and r and o:
+                    self.memory.add_knowledge(s, r, o, confidence=0.8)
+
         if action_type == "chat":
             # Pure conversation — respond and stay idle
             self.memory.add_event("thought", f"User wants to chat. Responding.")
@@ -269,6 +381,31 @@ class CognitiveBrain:
             if response:
                 self._say(response)
             self._execute_goal(goal or user_input)
+
+        elif action_type == "schedule":
+            # User wants something done later or on a recurring basis
+            schedule_at = decision.get("schedule_at", "")
+            recurrence = decision.get("recurrence_seconds")
+            if goal and schedule_at and self.reasoning:
+                self.reasoning.schedule_goal(
+                    goal,
+                    schedule_at,
+                    priority=0,
+                    recurrence_seconds=recurrence,
+                )
+                self.memory.add_event(
+                    "scheduled_goal",
+                    f"Scheduled: {goal} at {schedule_at}"
+                    + (f" (every {recurrence}s)" if recurrence else ""),
+                )
+            if response:
+                self._say(response)
+
+        elif action_type == "sleep":
+            # User told the AI to go to sleep
+            if response:
+                self._say(response)
+            self._fall_asleep()
 
     def _think_about_input(self, user_input: str) -> dict:
         """Use LLM to decide how to handle user input."""
@@ -302,16 +439,26 @@ The user just said: "{user_input}"
 
 Decide how to handle this. Output a JSON object:
 {{
-  "type": "chat" | "action" | "chat_and_action",
+  "type": "chat" | "action" | "chat_and_action" | "schedule" | "sleep",
   "response": "what to say to the user (natural, in-character)",
-  "goal": "if action needed, the specific task to execute (empty string if just chatting)",
+  "goal": "if action/schedule needed, the specific task to execute (empty string if just chatting)",
+  "schedule_at": "ISO-8601 datetime for scheduled tasks e.g. 2026-03-06T21:00:00 (empty string if not scheduling)",
+  "recurrence_seconds": null,
   "user_name": "user's name if they told you (null if not mentioned)",
-  "learn": ["any new facts to remember about the user or their preferences"]
+  "learn": ["any new facts to remember about the user or their preferences"],
+  "knowledge": [
+    {{"subject": "entity", "relation": "relationship", "object": "entity"}}
+  ]
 }}
 
 Rules:
 - For greetings, questions, and small talk → type "chat"
-- For requests to DO something on the computer → type "action" or "chat_and_action"
+- For requests to DO something on the computer RIGHT NOW → type "action" or "chat_and_action"
+- For requests to do something LATER or on a SCHEDULE ("remind me", "at 9 pm", "in 30 minutes", "every hour", "tomorrow at") → type "schedule"
+  * Set schedule_at to the ISO-8601 datetime to run the task (infer from context + current time)
+  * For recurring tasks set recurrence_seconds (e.g. 3600 for hourly, 86400 for daily), otherwise null
+- For "go to sleep", "take a nap", "rest" → type "sleep"
+- If the user shares factual knowledge, add it to "knowledge" as triples
 - Your response should be natural and in-character (1-2 sentences, not robotic)
 - The goal should be a clear task description for the executor
 - Output ONLY valid JSON. No markdown, no explanation."""
@@ -346,12 +493,22 @@ Rules:
         """Run a goal through the reasoning engine + executor."""
         self.state = CognitiveState.EXECUTING
         self.current_goal = goal
+        self._energy = max(0, self._energy - ENERGY_COST_GOAL)
         self.memory.add_event("action", f"Starting goal: {goal}")
+
+        # Focus attention on the goal
+        if self.attention:
+            self.attention.set_goal(goal)
 
         # Inject learned strategies into reasoning context
         strategy_ctx = ""
         if self.self_improver:
             strategy_ctx = self.self_improver.get_context_for_llm()
+
+        # Inject skill-graph context
+        skill_ctx = ""
+        if self.skill_graph:
+            skill_ctx = self.skill_graph.get_context_for_llm()
 
         # Create a plan via the reasoning engine
         if self.reasoning:
@@ -360,6 +517,8 @@ Rules:
                 world_ctx = self.world_state.get_context_for_llm(10)
             if strategy_ctx:
                 world_ctx = f"{world_ctx}\n\nLEARNED STRATEGIES:\n{strategy_ctx}"
+            if skill_ctx:
+                world_ctx = f"{world_ctx}\n\nSKILL PROFILE:\n{skill_ctx}"
             plan = self.reasoning.set_goal(goal, world_ctx)
             self.memory.add_event("thought",
                 f"Plan ({len(plan.steps)} steps): "
@@ -383,6 +542,12 @@ Rules:
             steps = len(self.executor.action_history)
             self.memory.log_episode(goal, outcome, steps, success)
 
+            # Update skill graph with action outcomes
+            if self.skill_graph and self.executor.action_history:
+                self.skill_graph.record_goal(
+                    goal, self.executor.action_history, success,
+                )
+
             # Log episode summary for the learning subsystem
             if hasattr(self.executor, 'exp_logger'):
                 self.executor.exp_logger.log_episode_summary(
@@ -403,6 +568,10 @@ Rules:
         self.state = CognitiveState.IDLE
         self.current_goal = None
         self._idle_cycles = 0
+
+        # Release goal-focused attention
+        if self.attention:
+            self.attention.set_goal(None)
 
     def _reflect_on_outcome(self, goal: str, success: bool, steps: int):
         """Reflect on a completed goal — learn from the experience."""
@@ -459,7 +628,126 @@ Output ONLY valid JSON."""
         except Exception:
             pass  # reflection is best-effort
 
+    # ── Sleep / wake cycle ────────────────────────────────────────────
+
+    def _fall_asleep(self):
+        """Transition from IDLE to SLEEPING."""
+        self.state = CognitiveState.SLEEPING
+        self._idle_cycles = 0
+        self._nightly_trained_this_sleep = False
+        self.memory.add_event("system", "Falling asleep")
+        print(f"[Brain] Falling asleep... (energy: {self._energy:.0f}%)")
+        self._say("I'm feeling tired... going to rest for a bit.")
+
+        if self.dream_engine:
+            self.dream_engine.mark_idle()
+        if self.behavior:
+            self.behavior.emotion.react("idle_long", "falling asleep")
+
+    def _wake_up(self, reason: str = ""):
+        """Transition from SLEEPING back to IDLE."""
+        was_sleeping = self.state == CognitiveState.SLEEPING
+        self.state = CognitiveState.IDLE
+        self._idle_cycles = 0
+
+        if self.dream_engine:
+            self.dream_engine.mark_active()
+
+        if was_sleeping:
+            self.memory.add_event("system", f"Waking up (reason: {reason})")
+            print(f"[Brain] Waking up ({reason})")
+
+            # Share a dream if one just happened
+            last_dream = self.dream_engine.get_last_dream() if self.dream_engine else None
+            if last_dream and time.time() - last_dream.get("timestamp", 0) < 120:
+                theme = last_dream.get("theme", "something")
+                self._say(f"*yawns* I'm awake! I was just dreaming about {theme}...")
+            else:
+                self._say("*yawns* I'm awake now!")
+
+            if self.behavior:
+                self.behavior.emotion.react("user_return", "waking up")
+
+    # ── Dreaming ─────────────────────────────────────────────────────
+
+    def _dream_cycle(self):
+        """Run a dream cycle during sleep."""
+        print("[Brain] Dreaming...")
+
+        if self.behavior:
+            self.behavior.emotion.react("interesting_observation", "dreaming")
+
+        dream = self.dream_engine.dream()
+        if not dream:
+            print("[Brain] Dream faded (not enough material).")
+            return
+
+        narrative = dream.get("narrative", "")
+        theme = dream.get("theme", "")
+        insights = dream.get("insights", [])
+
+        self.memory.add_event("dream",
+            f"Dreamed about: {theme}. {narrative}")
+        print(f"[Brain] Dream: [{theme}] {narrative}")
+
+        if insights:
+            for insight in insights[:3]:
+                print(f"[Brain] Dream insight: {insight}")
+
     # ── Autonomous thinking ──────────────────────────────────────────
+
+    def _do_timepass(self):
+        """Do a lightweight idle activity — humming, reading, observing, etc.
+
+        These are low-energy activities the AI does when bored but not tired
+        enough to sleep, similar to how people hum, doodle, or daydream.
+        """
+        activities = [
+            "humming a tune",
+            "quietly observing the screen",
+            "thinking about something random",
+            "mentally reviewing what I know",
+            "daydreaming",
+            "silently counting pixels",
+            "imagining what the user might do next",
+            "composing a haiku in my head",
+            "recalling an interesting fact",
+            "watching the system clock tick",
+            "stretching my virtual neurons",
+            "playing a word game with myself",
+        ]
+
+        import random
+        activity = random.choice(activities)
+
+        # Occasionally use LLM for richer timepass
+        if random.random() < 0.3:
+            try:
+                mood_label = self.mood if self.behavior else "calm"
+                resp = self.groq.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"You're a bored AI with mood '{mood_label}'. "
+                            f"Pick a quick idle activity (humming, singing a line, "
+                            f"making an observation, reading something, daydreaming). "
+                            f"Describe what you're doing in ONE short sentence from first person. "
+                            f"Output ONLY the sentence."
+                        ),
+                    }],
+                    max_tokens=40, temperature=0.9,
+                )
+                activity = resp.choices[0].message.content.strip()
+            except Exception:
+                pass
+
+        self.memory.add_event("timepass", activity)
+        print(f"[Brain] ~ {activity}")
+
+        # Occasionally say it aloud (10% chance)
+        if random.random() < 0.1:
+            self._say(f"*{activity}*")
 
     def _autonomous_think(self):
         """The AI thinks on its own — observes, generates thoughts, and
@@ -502,9 +790,26 @@ Output ONLY valid JSON."""
         if self.curiosity:
             curiosity_context = self.curiosity.get_context_for_llm()
 
+        # Inject attention context
+        attention_context = ""
+        if self.attention:
+            attention_context = self.attention.get_context_for_llm()
+
+        # Inject dream context
+        dream_context = ""
+        if self.dream_engine:
+            dream_context = self.dream_engine.get_context_for_llm()
+
+        # Inject knowledge graph context
+        knowledge_context = ""
+        if hasattr(self.memory, 'knowledge_graph'):
+            knowledge_context = self.memory.knowledge_graph.get_context_for_llm(10)
+
         # ── Step 1: Inner monologue (always runs) ────────────────
         self._inner_monologue(observation, world_context,
-                              emotional_context, curiosity_context)
+                              emotional_context, curiosity_context,
+                              attention_context, dream_context,
+                              knowledge_context)
 
         # ── Step 2: Curiosity-driven goal generation ─────────────
         if self.curiosity and self.behavior:
@@ -512,19 +817,32 @@ Output ONLY valid JSON."""
                 self._curiosity_goal_cycle(observation, world_context)
 
     def _inner_monologue(self, observation: str, world_context: str,
-                         emotional_context: str, curiosity_context: str):
+                         emotional_context: str, curiosity_context: str,
+                         attention_context: str = "",
+                         dream_context: str = "",
+                         knowledge_context: str = ""):
         """Generate an inner thought + optionally speak."""
         prompt = f"""{PERSONA}
 
 CURRENT STATE:
 - Time: {time.strftime("%H:%M, %A %B %d")}
 - State: Idle (no active task)
+- Energy: {self._energy:.0f}%
 
 EMOTIONAL STATE:
 {emotional_context}
 
+ATTENTION FOCUS:
+{attention_context if attention_context else "(attending to everything)"}
+
 CURIOSITY:
 {curiosity_context if curiosity_context else "(no active curiosities)"}
+
+DREAMS:
+{dream_context if dream_context else "(no recent dreams)"}
+
+KNOWN KNOWLEDGE:
+{knowledge_context if knowledge_context else "(no structured knowledge yet)"}
 
 WORLD CONTEXT:
 {world_context}
@@ -537,12 +855,16 @@ Output a JSON object:
 {{
   "thought": "your inner monologue (1-2 sentences — what you notice, wonder about, or reflect on)",
   "speak": "something to say to the user (empty string to stay quiet — usually stay quiet)",
-  "questions": ["any new questions this observation makes you curious about (0-2, empty list if nothing)"]
+  "questions": ["any new questions this observation makes you curious about (0-2, empty list if nothing)"],
+  "knowledge": [
+    {{"subject": "entity1", "relation": "relationship", "object": "entity2"}}
+  ]
 }}
 
 Rules:
 - Your thoughts should show genuine curiosity — notice things, wonder about them
 - Ask yourself questions about what you observe
+- If you learn a factual relationship, add it to "knowledge" (e.g. {{"subject": "VS Code", "relation": "is_a", "object": "code editor"}})
 - MOSTLY stay quiet. Only speak if something is truly notable.
 - Output ONLY valid JSON."""
 
@@ -575,6 +897,15 @@ Rules:
                 for q in result.get("questions", []):
                     if q.strip():
                         self.curiosity.add_question(q.strip(), "inner_thought")
+
+            # Store knowledge graph relations from observations
+            if hasattr(self.memory, 'add_knowledge'):
+                for triple in result.get("knowledge", []):
+                    s = triple.get("subject", "")
+                    r = triple.get("relation", "")
+                    o = triple.get("object", "")
+                    if s and r and o:
+                        self.memory.add_knowledge(s, r, o, confidence=0.6)
 
         except Exception as e:
             print(f"[Brain] Inner monologue failed: {e}")
@@ -713,16 +1044,57 @@ Rules:
     # ── Utilities ────────────────────────────────────────────────────
 
     def _perceive(self) -> str:
-        """Get a world-state summary.
+        """Get an attention-filtered world-state summary.
 
-        Uses WorldStateManager if available (richer context including
-        memory + emotion), falls back to raw PerceptionManager."""
+        When an AttentionSystem is available, raw perception is
+        scored and filtered so only salient channels reach the brain.
+        Falls back to unfiltered WorldStateManager / PerceptionManager."""
+        # ── Attention-gated path ──────────────────────────────────
+        if self.attention is not None and self.world_state is not None:
+            try:
+                raw_state = self.world_state.get_full_state()
+                filtered = self.attention.process(
+                    raw_state, cognitive_state=self.state.name,
+                )
+                # Build context string from filtered state only
+                parts = []
+                emo = filtered.get("emotion", {})
+                parts.append(f"Mood: {emo.get('mood', 'unknown')}")
+                for ch in ("screen", "system", "camera"):
+                    ch_data = filtered.get(ch)
+                    if ch_data and isinstance(ch_data, dict):
+                        s = ch_data.get("summary", "")
+                        if s:
+                            parts.append(f"{ch.title()}: {s}")
+                audio = filtered.get("audio", {})
+                if audio and isinstance(audio, dict):
+                    s = audio.get("summary", "")
+                    if s:
+                        parts.append(f"Audio: {s}")
+                mem = filtered.get("memory", {})
+                lt = mem.get("long_term", "")
+                if lt:
+                    parts.append(f"Long-term memory:\n{lt}")
+                episodes = mem.get("episodes", "")
+                if episodes:
+                    parts.append(f"Recent episodes:\n{episodes}")
+                events = mem.get("recent_events", [])
+                if events:
+                    recent = events[-10:]
+                    lines = [f"  [{e.get('type','?')}] {e.get('content','')}"
+                             for e in recent if isinstance(e, dict)]
+                    if lines:
+                        parts.append("Recent events:\n" + "\n".join(lines))
+                return "\n\n".join(parts) if parts else ""
+            except Exception:
+                pass  # fall through to unfiltered path
+
+        # ── Unfiltered fallback ───────────────────────────────────
         if self.world_state is not None:
             try:
                 return self.world_state.get_context_for_llm(max_events=10)
             except Exception:
                 pass
-        # Fallback: raw perception
         if self.perception is None:
             return ""
         try:

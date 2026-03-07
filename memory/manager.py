@@ -23,6 +23,7 @@ from .short_term import ShortTermMemory
 from .episodic import EpisodicMemory
 from .semantic import SemanticMemory
 from .vector import VectorMemory
+from .knowledge_graph import KnowledgeGraph
 
 MEMORY_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -41,6 +42,7 @@ class MemoryManager:
         self.episodic = EpisodicMemory(self._store_dir)
         self.semantic = SemanticMemory(self._store_dir)
         self.vector = VectorMemory(self._store_dir)
+        self.knowledge_graph = KnowledgeGraph(self._store_dir)
 
     def cross_search(self, keyword: str, limit: int = 10) -> dict:
         """Search across all memory types for *keyword*.
@@ -59,6 +61,7 @@ class MemoryManager:
                 e for e in self.short_term.get_recent(50)
                 if keyword.lower() in e.get("content", "").lower()
             ][-limit:],
+            "knowledge": self.knowledge_graph.search_entities(keyword, limit=limit),
         }
 
     def stats(self) -> dict:
@@ -67,6 +70,8 @@ class MemoryManager:
             "short_term_events": self.short_term.size,
             "episodic_total": self.episodic.total_episodes,
             "semantic_facts": len(self.semantic.get_facts()),
+            "knowledge_entities": self.knowledge_graph.entity_count,
+            "knowledge_relations": self.knowledge_graph.relation_count,
             "vector_items": self.vector.size,
             "vector_categories": self.vector.category_counts(),
         }
@@ -119,3 +124,20 @@ class MemorySystem(MemoryManager):
 
     def get_long_term_summary(self) -> str:
         return self.semantic.get_summary()
+
+    # ── Knowledge graph (delegates to self.knowledge_graph) ──────
+
+    def add_knowledge(self, source: str, relation: str, target: str,
+                      confidence: float = 0.8) -> bool:
+        return self.knowledge_graph.add_relation(source, target, relation, confidence)
+
+    def add_entity(self, name: str, entity_type: str = "thing",
+                   properties: dict | None = None) -> str:
+        return self.knowledge_graph.add_entity(name, entity_type, properties)
+
+    def query_knowledge(self, subject: str = "", relation: str = "",
+                        obj: str = "") -> list[dict]:
+        return self.knowledge_graph.query(subject, relation, obj)
+
+    def get_knowledge_summary(self) -> str:
+        return self.knowledge_graph.get_summary()

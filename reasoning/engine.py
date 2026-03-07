@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import time
 import threading
+from datetime import datetime
 from typing import Any
 
 from .planner import Planner, Plan, Step
@@ -107,9 +108,10 @@ class ReasoningEngine:
 
     def __init__(self, policy: BasePolicy | None = None,
                  planner: Planner | None = None,
-                 behavior: Any = None):
+                 behavior: Any = None,
+                 store_dir: str = "memory_store"):
         self.policy: BasePolicy = policy or LLMPolicy()
-        self.planner: Planner = planner or Planner()
+        self.planner: Planner = planner or Planner(store_dir=store_dir)
         self.behavior = behavior
 
         self._lock = threading.Lock()
@@ -144,6 +146,49 @@ class ReasoningEngine:
                 print(f"[ReasoningEngine] Plan warnings: {warnings}")
 
             return plan
+
+    # -- Scheduled goals -------------------------------------------------
+
+    def schedule_goal(
+        self,
+        goal_text: str,
+        run_at: float | datetime | str,
+        *,
+        world_context: str = "",
+        priority: int = 0,
+        recurrence_seconds: float | None = None,
+    ) -> dict:
+        """Register a goal for future execution."""
+        task = self.planner.schedule_task(
+            goal_text,
+            run_at,
+            context=world_context,
+            priority=priority,
+            recurrence_seconds=recurrence_seconds,
+        )
+        return task.to_dict()
+
+    def list_scheduled_goals(self) -> list[dict]:
+        return [t.to_dict() for t in self.planner.list_scheduled_tasks()]
+
+    def cancel_scheduled_goal(self, task_id: str) -> bool:
+        return self.planner.cancel_scheduled_task(task_id)
+
+    def dequeue_due_scheduled_goal(self, now_ts: float | None = None) -> dict | None:
+        """Return the next due scheduled goal payload, if any."""
+        due = self.planner.pop_due_scheduled_tasks(now_ts)
+        if not due:
+            return None
+
+        task = due[0]
+        return {
+            "task_id": task.id,
+            "goal": task.goal,
+            "context": task.context,
+            "run_at": task.run_at,
+            "priority": task.priority,
+            "recurrence_seconds": task.recurrence_seconds,
+        }
 
     @property
     def current_plan(self) -> Plan | None:
@@ -283,6 +328,7 @@ class ReasoningEngine:
             "plan": self._current_plan.to_dict() if self._current_plan else None,
             "replan_count": self._replan_count,
             "consecutive_failures": self._consecutive_failures,
+            "scheduled_tasks": self.list_scheduled_goals(),
         }
 
     # ── Internal ─────────────────────────────────────────────────

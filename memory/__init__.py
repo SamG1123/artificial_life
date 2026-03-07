@@ -16,6 +16,7 @@ from .short_term import ShortTermMemory
 from .episodic import EpisodicMemory
 from .semantic import SemanticMemory
 from .vector import VectorMemory
+from .knowledge_graph import KnowledgeGraph
 from .manager import MemoryManager, MemorySystem
 from .compressor import MemoryCompressor
 
@@ -24,6 +25,7 @@ __all__ = [
     "EpisodicMemory",
     "SemanticMemory",
     "VectorMemory",
+    "KnowledgeGraph",
     "MemoryManager",
     "MemorySystem",
     "MemoryCompressor",
