@@ -63,11 +63,12 @@ class LanguageProcessor:
             response = self.generate_response(text)
             return response
 
-        elif intent == "PC_CONTROL":
-            # Put the raw command on the goal queue for the executor thread
+        elif intent in ("PC_CONTROL", "MEDIA_CONTROL", "TASK_MANAGEMENT",
+                         "CREATIVE", "SYSTEM_CONTROL"):
+            # Every actionable intent goes to the unified executor
             if not global_goal_queue.full():
                 global_goal_queue.put(text)
-                return f"Got it, executing: {text}"
+                return f"Got it, working on: {text}"
             else:
                 return "I'm busy with another task, please wait."
 
