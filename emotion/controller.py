@@ -151,6 +151,39 @@ class BehaviorController:
             parts.append(f"Response style: {v}")
         return "\n".join(parts)
 
+    def get_speaking_style(self) -> dict:
+        """Return style modifiers for TTS.
+
+        Keys:
+            verbosity: brief | normal | detailed
+            speed: multiplicative speed factor
+            formality: casual | neutral | formal
+        """
+        ms = self.mood.get_state()
+        dom = self.emotion.dominant()
+        empathy = self.personality.get("empathy")
+        playful = self.personality.get("playfulness")
+
+        verbosity = self.verbosity()
+        speed = 1.0
+        formality = "neutral"
+
+        if dom in ("surprise", "amusement"):
+            speed *= 1.05
+        if dom in ("concern", "disappointment", "frustration"):
+            speed *= 0.92
+
+        if playful > 0.65 and ms["valence"] > 0.2:
+            formality = "casual"
+        elif empathy > 0.7 and ms["focus"] > 0.55:
+            formality = "formal"
+
+        return {
+            "verbosity": verbosity,
+            "speed": round(max(0.8, min(1.2, speed)), 2),
+            "formality": formality,
+        }
+
     def get_full_state(self) -> dict:
         """Return the complete emotional state as a serialisable dict."""
         return {

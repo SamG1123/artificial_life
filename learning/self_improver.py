@@ -26,6 +26,7 @@ Capabilities:
 import os
 import json
 import time
+import csv
 from threading import Lock
 from pathlib import Path
 
@@ -68,6 +69,7 @@ class SelfImprover:
             "known_weaknesses": [],
             "known_strengths": [],
             "improvement_goals": [],
+            "strategy_trials": {},
         })
 
         self._groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -90,6 +92,7 @@ class SelfImprover:
             "analysis": None,
             "strategies_generated": 0,
             "retrained": False,
+            "correction_retrained": False,
         }
 
         # 1. Performance analysis
@@ -107,8 +110,10 @@ class SelfImprover:
         if self._should_retrain():
             retrained = self._trigger_retrain()
             report["retrained"] = retrained
+            report["correction_retrained"] = self._trigger_correction_retrain()
 
         # 4. Journal the cycle
+        self._prune_low_confidence_strategies()
         self._journal_entry(report)
 
         return report
@@ -299,6 +304,33 @@ Rules:
             print(f"[SelfImprover] Retraining failed: {e}")
             return False
 
+    def _trigger_correction_retrain(self) -> bool:
+        """Optional correction-learning training when enough correction examples exist."""
+        try:
+            path = self.dataset_builder.build("correction")
+            if path is None:
+                return False
+
+            rows = 0
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                rows = max(0, sum(1 for _ in csv.reader(f)) - 1)
+            if rows < 12:
+                return False
+
+            meta = self.trainer.train_correction_classifier(
+                str(path),
+                run_name=f"correction_{time.strftime('%Y%m%d')}",
+                epochs=4,
+            )
+            accuracy = meta.get("eval_accuracy", 0)
+            self.memory.semantic.add_self_note(
+                f"[Self-improvement] Trained correction model — accuracy: {accuracy:.1%}"
+            )
+            return True
+        except Exception as e:
+            print(f"[SelfImprover] Correction retraining failed: {e}")
+            return False
+
     # ── Strategy access (for brain/reasoning to use) ─────────────
 
     def get_strategies(self, category: str = "action") -> list[str]:
@@ -323,8 +355,14 @@ Rules:
         """Summary of strategies for injecting into LLM prompts."""
         parts = []
         strats = self.get_strategies("action")
+        scored = sorted(
+            [(s, self.get_strategy_confidence(s)) for s in strats],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        trusted = [s for s, c in scored if c >= 0.45]
         if strats:
-            parts.append("Learned strategies: " + "; ".join(strats[-3:]))
+            parts.append("Learned strategies: " + "; ".join(trusted[-3:] if trusted else strats[-2:]))
         weak = self.get_weaknesses()
         if weak:
             parts.append("Known weaknesses: " + "; ".join(weak[-2:]))
@@ -332,6 +370,83 @@ Rules:
         if goals:
             parts.append("Improvement goals: " + "; ".join(goals[-2:]))
         return "\n".join(parts) if parts else ""
+
+    # ── Strategy validation loop ───────────────────────────────
+
+    def record_strategy_outcome(self, goal: str, success: bool,
+                                reward_total: float = 0.0) -> None:
+        """Track whether strategies are helping on real episodes."""
+        goal_l = (goal or "").lower()
+        with self._lock:
+            trials = self._strategies.setdefault("strategy_trials", {})
+            for s in self._strategies.get("action_strategies", []):
+                sl = s.lower()
+                # Lightweight matching: if strategy keywords appear in goal, count trial.
+                if any(tok for tok in sl.split() if len(tok) > 4 and tok in goal_l):
+                    rec = trials.setdefault(s, {
+                        "attempts": 0,
+                        "successes": 0,
+                        "reward_sum": 0.0,
+                        "last_used": 0.0,
+                    })
+                    rec["attempts"] += 1
+                    if success:
+                        rec["successes"] += 1
+                    rec["reward_sum"] += float(reward_total)
+                    rec["last_used"] = time.time()
+
+            # Keep table bounded for long runs
+            if len(trials) > 100:
+                ordered = sorted(
+                    trials.items(),
+                    key=lambda kv: kv[1].get("last_used", 0.0),
+                    reverse=True,
+                )[:100]
+                self._strategies["strategy_trials"] = dict(ordered)
+        self._save_strategies()
+
+    def get_strategy_confidence(self, strategy: str) -> float:
+        """Confidence in [0,1] based on success + reward trend."""
+        with self._lock:
+            rec = self._strategies.get("strategy_trials", {}).get(strategy, {})
+        return self._confidence_from_record(rec)
+
+    def _prune_low_confidence_strategies(self) -> None:
+        """Demote strategies that consistently underperform."""
+        with self._lock:
+            action_strategies = list(self._strategies.get("action_strategies", []))
+            trials = self._strategies.get("strategy_trials", {})
+            kept = []
+            demoted = []
+            for s in action_strategies:
+                rec = trials.get(s, {})
+                attempts = int(rec.get("attempts", 0))
+                conf = self._confidence_from_record(rec)
+                if attempts >= 5 and conf < 0.25:
+                    demoted.append(s)
+                else:
+                    kept.append(s)
+            self._strategies["action_strategies"] = kept[-20:]
+        if demoted:
+            self.memory.semantic.add_self_note(
+                "[Self-improvement] Demoted low-confidence strategies: " +
+                "; ".join(demoted[:4])
+            )
+            self._save_strategies()
+
+    @staticmethod
+    def _confidence_from_record(rec: dict) -> float:
+        attempts = int(rec.get("attempts", 0))
+        if attempts <= 0:
+            return 0.5
+        successes = int(rec.get("successes", 0))
+        reward_sum = float(rec.get("reward_sum", 0.0))
+        success_rate = successes / max(1, attempts)
+        avg_reward = reward_sum / max(1, attempts)
+        reward_norm = max(0.0, min(1.0, (avg_reward + 0.5)))
+        coverage = min(1.0, attempts / 8.0)
+        confidence = (0.55 * success_rate) + (0.30 * reward_norm) + (0.15 * coverage)
+        return round(max(0.0, min(1.0, confidence)), 3)
 
     # ── Journal ──────────────────────────────────────────────────
 

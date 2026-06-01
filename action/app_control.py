@@ -7,6 +7,7 @@ subprocess for launching apps.
 import os
 import time
 import subprocess
+import shutil
 
 import pyautogui as pag
 
@@ -15,7 +16,10 @@ try:
 except ImportError:
     gw = None
 
-from .base import BaseController
+from .base import BaseController, UndoEntry
+from logging_config import get_logger
+
+log = get_logger("app_ctrl")
 
 
 class AppController(BaseController):
@@ -23,6 +27,7 @@ class AppController(BaseController):
 
     def __init__(self):
         self._last_result: str = ""
+        self._undo_stack: list[UndoEntry] = []
 
     # ── BaseController ───────────────────────────────────────────
 
@@ -36,21 +41,73 @@ class AppController(BaseController):
         if not app_name:
             return self._fail("open_app: empty app_name")
 
-        app = app_name.strip().lower()
-        print(f"  [AppCtrl] Opening: {app_name}")
+        app = app_name.strip()
+        log.info("Opening: %s", app_name)
         try:
-            if os.name == "nt":
-                os.startfile(app)
-            else:
-                subprocess.Popen([app])
+            launched = self._launch_windows_app(app) if os.name == "nt" else self._launch_posix_app(app)
+            if not launched:
+                return self._fail(f"Failed to resolve {app_name}")
             time.sleep(2)
 
             # Try to maximise + bring to front
             self._focus_window(app)
             self._last_result = f"SUCCESS: opened {app_name}"
+            # Register undo: close the app we just opened
+            _name = app_name
+            self._undo_stack.append(UndoEntry(
+                f"close {_name}",
+                lambda: self.close_app(_name),
+            ))
             return self._last_result
         except Exception as e:
             return self._fail(f"Failed to open {app_name}: {e}")
+
+    def _launch_posix_app(self, app: str) -> bool:
+        try:
+            subprocess.Popen([app])
+            return True
+        except Exception:
+            return False
+
+    def _launch_windows_app(self, app: str) -> bool:
+        resolved = self._resolve_windows_app(app)
+        try:
+            if resolved.startswith(("steam://", "http://", "https://")):
+                os.startfile(resolved)
+            elif os.path.isfile(resolved):
+                subprocess.Popen([resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which(resolved):
+                subprocess.Popen([resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.startfile(resolved)
+            return True
+        except Exception as e:
+            log.warning("Windows launch failed for %s -> %s: %s", app, resolved, e)
+            return False
+
+    def _resolve_windows_app(self, app: str) -> str:
+        target = app.strip().lower()
+
+        if target in {"steam", "steam app", "steam application"}:
+            candidates = [
+                os.path.expandvars(r"%ProgramFiles(x86)%\Steam\Steam.exe"),
+                os.path.expandvars(r"%ProgramFiles%\Steam\Steam.exe"),
+                os.path.expandvars(r"%LocalAppData%\Steam\Steam.exe"),
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    return candidate
+            return "steam://open/main"
+
+        if target.endswith(".exe") or os.path.sep in target:
+            return app
+
+        # Try PATH first, then rely on shell launch for registered app aliases.
+        which = shutil.which(app)
+        if which:
+            return which
+
+        return app
 
     def close_app(self, app_name: str) -> str:
         """Close a window whose title contains *app_name*."""
@@ -127,6 +184,16 @@ class AppController(BaseController):
             pag.hotkey("win", "up")
 
     def _fail(self, msg: str) -> str:
-        print(f"  [AppCtrl] {msg}")
+        log.warning("%s", msg)
         self._last_result = f"FAILED: {msg}"
         return self._last_result
+
+    # ── Rollback helpers ─────────────────────────────────────────
+
+    def pop_undo(self) -> UndoEntry | None:
+        """Pop the most recent undo entry."""
+        return self._undo_stack.pop() if self._undo_stack else None
+
+    def clear_undo(self) -> None:
+        """Discard all undo entries."""
+        self._undo_stack.clear()

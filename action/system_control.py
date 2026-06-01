@@ -10,7 +10,10 @@ import os
 import shutil
 import subprocess
 
-from .base import BaseController
+from .base import BaseController, UndoEntry
+from logging_config import get_logger
+
+log = get_logger("system_ctrl")
 
 
 class SystemController(BaseController):
@@ -20,6 +23,7 @@ class SystemController(BaseController):
 
     def __init__(self):
         self._last_result: str = ""
+        self._undo_stack: list[UndoEntry] = []
 
     # ── BaseController ───────────────────────────────────────────
 
@@ -33,7 +37,7 @@ class SystemController(BaseController):
         if not command.strip():
             return self._fail("Empty command")
 
-        print(f"  [SysCtrl] Running: {command}")
+        log.info("Running: %s", command)
         try:
             result = subprocess.run(
                 command,
@@ -56,7 +60,7 @@ class SystemController(BaseController):
         except Exception as e:
             self._last_result = f"FAILED: {e}"
 
-        print(f"  [SysCtrl] {self._last_result[:200]}")
+        log.info("%s", self._last_result[:200])
         return self._last_result
 
     # ── Power management ─────────────────────────────────────────
@@ -105,10 +109,27 @@ class SystemController(BaseController):
     def write_file(self, path: str, content: str) -> str:
         """Write *content* to a text file."""
         try:
+            existed = os.path.exists(path)
+            old_content = None
+            if existed:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    old_content = f.read()
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             self._last_result = f"Wrote {len(content)} chars to {path}"
+            # Register undo
+            _path, _old, _existed = path, old_content, existed
+            if _existed and _old is not None:
+                self._undo_stack.append(UndoEntry(
+                    f"restore {_path}",
+                    lambda: self._restore_file(_path, _old),
+                ))
+            else:
+                self._undo_stack.append(UndoEntry(
+                    f"delete created {_path}",
+                    lambda: self._delete_path(_path),
+                ))
             return self._last_result
         except Exception as e:
             return self._fail(f"write_file: {e}")
@@ -132,6 +153,12 @@ class SystemController(BaseController):
             os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
             shutil.move(src, dst)
             self._last_result = f"Moved {src} → {dst}"
+            # Register undo (reverse move)
+            _src, _dst = src, dst
+            self._undo_stack.append(UndoEntry(
+                f"move {_dst} back to {_src}",
+                lambda: (shutil.move(_dst, _src), "moved back")[1],
+            ))
             return self._last_result
         except Exception as e:
             return self._fail(f"move_file: {e}")
@@ -146,6 +173,30 @@ class SystemController(BaseController):
     # ── Internals ────────────────────────────────────────────────
 
     def _fail(self, msg: str) -> str:
-        print(f"  [SysCtrl] {msg}")
+        log.warning("%s", msg)
         self._last_result = f"FAILED: {msg}"
         return self._last_result
+
+    # ── Rollback helpers ─────────────────────────────────────────
+
+    def pop_undo(self) -> UndoEntry | None:
+        """Pop the most recent undo entry (used by executor on failure)."""
+        return self._undo_stack.pop() if self._undo_stack else None
+
+    def clear_undo(self) -> None:
+        """Discard all undo entries (goal succeeded, no rollback needed)."""
+        self._undo_stack.clear()
+
+    @staticmethod
+    def _restore_file(path: str, old_content: str) -> str:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(old_content)
+        return f"restored {path}"
+
+    @staticmethod
+    def _delete_path(path: str) -> str:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
+        return f"deleted {path}"

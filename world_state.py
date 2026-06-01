@@ -80,6 +80,8 @@ class WorldStateManager:
             "camera":  {},
             "audio":   {},
             "system":  {},
+            "applications": {},
+            "current_app": {},
             "memory": {
                 "recent_events": [],
                 "long_term": "",
@@ -107,6 +109,10 @@ class WorldStateManager:
             for key in ("screen", "camera", "audio", "system"):
                 if key in perception_snapshot:
                     self._state[key] = perception_snapshot[key]
+
+            # Build persistent app context from latest screen state.
+            self._update_app_context_locked()
+
             self._state["timestamp"] = now
             self._rebuild_summary()
 
@@ -228,6 +234,40 @@ class WorldStateManager:
             if summary:
                 parts.append(f"{ch.title()}: {summary}")
 
+        # Screen change events (if provided by perception layer)
+        screen_data = (s.get("screen") or {}).get("data", {})
+        events = screen_data.get("change_events", []) if isinstance(screen_data, dict) else []
+        if events:
+            parts.append("Screen events: " + "; ".join(events[:4]))
+
+        # Application state context
+        current_app = s.get("current_app", {})
+        if current_app.get("app"):
+            app_line = f"Current app: {current_app.get('app')}"
+            if current_app.get("status"):
+                app_line += f" ({current_app['status']})"
+            if current_app.get("unsaved_changes"):
+                app_line += ", unsaved changes"
+            if current_app.get("progress_percent") is not None:
+                app_line += f", progress {current_app['progress_percent']}%"
+            parts.append(app_line)
+
+        apps = s.get("applications", {})
+        if isinstance(apps, dict) and apps:
+            # Show up to 3 recently seen app statuses.
+            ranked = sorted(
+                apps.values(),
+                key=lambda a: float(a.get("last_seen", 0.0)),
+                reverse=True,
+            )
+            snippets = []
+            for a in ranked[:3]:
+                app_name = a.get("app", "?")
+                status = a.get("status", "unknown")
+                snippets.append(f"{app_name}:{status}")
+            if snippets:
+                parts.append("Recent app states: " + ", ".join(snippets))
+
         # Audio
         audio = s.get("audio", {})
         audio_summary = audio.get("summary", "")
@@ -316,7 +356,32 @@ class WorldStateManager:
             s = (self._state.get(ch) or {}).get("summary", "")
             if s:
                 parts.append(s)
+        cur = self._state.get("current_app", {})
+        if cur.get("app"):
+            parts.append(f"App {cur.get('app')}={cur.get('status', 'unknown')}")
         emo = self._state.get("emotion", {})
         if emo.get("mood"):
             parts.append(f"Mood: {emo['mood']}")
         self._state["summary"] = " | ".join(parts)
+
+    def _update_app_context_locked(self) -> None:
+        """Update per-app persistent state from latest screen payload.
+        Caller must hold self._lock.
+        """
+        screen = self._state.get("screen") or {}
+        data = screen.get("data", {}) if isinstance(screen, dict) else {}
+        app_state = data.get("app_state", {}) if isinstance(data, dict) else {}
+        app = app_state.get("app")
+        if not app:
+            return
+
+        now = time.time()
+        enriched = dict(app_state)
+        enriched["last_seen"] = now
+
+        apps = self._state.get("applications")
+        if not isinstance(apps, dict):
+            apps = {}
+        apps[app] = enriched
+        self._state["applications"] = apps
+        self._state["current_app"] = enriched

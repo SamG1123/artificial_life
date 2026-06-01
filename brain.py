@@ -29,20 +29,26 @@ import json
 import time
 import base64
 import threading
+import re
 from io import BytesIO
-from queue import Empty
+from queue import Empty, Full
 from enum import Enum, auto
 
 from groq import Groq
 from dotenv import load_dotenv
+from logging_config import get_logger
+from cognition import DialogueStateTracker
+from local_fallback import LocalFallbackModel
 
 load_dotenv()
 
+log = get_logger("brain")
+
 # How often the brain "ticks" in each state (seconds)
-TICK_IDLE = 5.0        # Slow tick when idle — observe & think
+TICK_IDLE = 10.0        # Slow tick when idle — observe & think
 TICK_ACTIVE = 0.3      # Fast tick when executing
 TICK_CONVERSING = 0.5  # Medium tick during conversation
-TICK_SLEEPING = 15.0   # Very slow tick during sleep — dreaming only
+TICK_SLEEPING = 30.0   # Very slow tick during sleep — dreaming only
 
 # Fatigue system — energy depletes with activity, recharges during sleep
 MAX_ENERGY = 1000.0
@@ -84,7 +90,13 @@ class CognitiveBrain:
                  perception=None, world_state=None, behavior=None,
                  reasoning=None, compressor=None, self_improver=None,
                  curiosity=None, skill_graph=None, attention=None,
-                 dream_engine=None, nightly_trainer=None):
+                 dream_engine=None, nightly_trainer=None,
+                 dialogue_tracker: DialogueStateTracker | None = None,
+                 notifications=None,
+                 preference_learner=None,
+                 reward_engine=None,
+                 idle_monitor=None,
+                 background_tasks=None):
         """
         Args:
             executor: AutomationExecutor instance (the "hands")
@@ -102,6 +114,12 @@ class CognitiveBrain:
             attention: AttentionSystem instance (cognitive focus management)
             dream_engine: DreamEngine instance (experience-based dreaming)
             nightly_trainer: NightlyTrainer instance (sleep-time training)
+            dialogue_tracker: DialogueStateTracker (conversation continuity)
+            notifications: NotificationEngine for proactive updates
+            preference_learner: PreferenceLearner for implicit personalization
+            reward_engine: RewardEngine for multi-dimensional learning signals
+            idle_monitor: IdleMonitor instance (user activity tracking)
+            background_tasks: BackgroundTaskManager instance (async task execution)
         """
         self.executor = executor
         self.memory = memory
@@ -118,19 +136,32 @@ class CognitiveBrain:
         self.attention = attention
         self.dream_engine = dream_engine
         self.nightly_trainer = nightly_trainer
+        self.dialogue = dialogue_tracker
+        self.notifications = notifications
+        self.preferences = preference_learner
+        self.reward_engine = reward_engine
+        self.idle_monitor = idle_monitor
+        self.background_tasks = background_tasks
         self.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.local_fallback = LocalFallbackModel()
 
         self.state = CognitiveState.IDLE
         self.current_goal = None
         self._idle_cycles = 0
         self._last_thought_time = 0
         self._last_observation = ""
-        self._conversation_buffer = []  # recent user messages for dialogue
+        self._conversation_buffer: list[dict] = []  # sliding window of recent exchanges
+        self._max_conversation_turns = 10  # keep last N user↔AI exchanges
         self._lock = threading.Lock()
+        self._last_speech_emotion: str | None = None
+        self._input_event = threading.Event()
 
         # Fatigue / energy system
         self._energy = MAX_ENERGY
         self._nightly_trained_this_sleep = False
+
+        # Background thread for scheduled tasks (so they don't block conversation)
+        self._scheduled_thread: threading.Thread | None = None
 
         # How many idle cycles before the AI has an autonomous thought
         self.THOUGHT_INTERVAL = 6  # ~30 seconds at 5s tick
@@ -138,14 +169,17 @@ class CognitiveBrain:
         # Periodic maintenance counters
         self._ticks_since_compression = 0
         self._ticks_since_improvement = 0
-        self.COMPRESSION_INTERVAL = 60    # compress every ~5 min at 5s tick
+        self.COMPRESSION_INTERVAL = 300    # compress every ~5 min at 5s tick
         self.IMPROVEMENT_INTERVAL = 8640   # self-improve every ~12 hrs
+
+        # State checkpoint (set externally by AgentController)
+        self._checkpoint = None
 
     # ── Main loop ────────────────────────────────────────────────────
 
     def run(self, stop_event: threading.Event):
         """Main cognitive loop — runs in its own thread."""
-        print("[Brain] Cognitive loop starting...")
+        log.info("Cognitive loop starting...")
         self.memory.add_event("system", "Brain started. Becoming aware.")
         self._say("I'm awake. What's going on?")
         time.sleep(1)
@@ -153,10 +187,11 @@ class CognitiveBrain:
         while not stop_event.is_set():
             try:
                 self._tick()
+                # Periodic state checkpoint
+                if self._checkpoint is not None:
+                    self._checkpoint.tick(self)
             except Exception as e:
-                print(f"[Brain] Error in cognitive tick: {e}")
-                import traceback
-                traceback.print_exc()
+                log.error("Error in cognitive tick: %s", e, exc_info=True)
                 time.sleep(2)
 
             # Tick rate depends on state
@@ -166,10 +201,23 @@ class CognitiveBrain:
                 CognitiveState.CONVERSING: TICK_CONVERSING,
                 CognitiveState.SLEEPING: TICK_SLEEPING,
             }.get(self.state, TICK_IDLE)
-            stop_event.wait(delay)
+
+            # Wake promptly when new user input arrives instead of waiting
+            # for the next full idle tick.
+            remaining = delay
+            while remaining > 0 and not stop_event.is_set():
+                slice_seconds = min(0.5, remaining)
+                if self._input_event.wait(slice_seconds):
+                    self._input_event.clear()
+                    break
+                remaining -= slice_seconds
+
+        # Save final checkpoint on clean shutdown
+        if self._checkpoint is not None:
+            self._checkpoint.save(self)
 
         self.memory.add_event("system", "Brain shutting down.")
-        print("[Brain] Cognitive loop stopped.")
+        log.info("Cognitive loop stopped.")
 
     @property
     def mood(self) -> str:
@@ -206,7 +254,7 @@ class CognitiveBrain:
                     self.memory.add_event("system",
                         f"Compressed memories → {result['insights_stored']} insights stored")
             except Exception as e:
-                print(f"[Brain] Memory compression failed: {e}")
+                log.warning("Memory compression failed: %s", e)
 
         if self.self_improver and self._ticks_since_improvement >= self.IMPROVEMENT_INTERVAL:
             self._ticks_since_improvement = 0
@@ -216,7 +264,7 @@ class CognitiveBrain:
                     self.memory.add_event("system",
                         f"Self-improvement: {report['strategies_generated']} new strategies")
             except Exception as e:
-                print(f"[Brain] Self-improvement cycle failed: {e}")
+                log.warning("Self-improvement cycle failed: %s", e)
 
         # 1. Check for user input (highest priority — even wakes from sleep)
         user_goal = self._check_for_user_input()
@@ -228,12 +276,16 @@ class CognitiveBrain:
             return
 
         # 1b. Pull due scheduled goals from the reasoning scheduler
+        #     Runs in a background thread so it never blocks user input.
         if self.state in (CognitiveState.IDLE, CognitiveState.SLEEPING):
-            was_sleeping = self.state == CognitiveState.SLEEPING
-            if self._handle_due_scheduled_goal():
-                if was_sleeping:
-                    self._wake_up(reason="scheduled task")
-                return
+            # Release finished thread reference so GC can reclaim it
+            if self._scheduled_thread is not None and not self._scheduled_thread.is_alive():
+                self._scheduled_thread = None
+            if self._scheduled_thread is None:
+                was_sleeping = self.state == CognitiveState.SLEEPING
+                if self._handle_due_scheduled_goal():
+                    if was_sleeping:
+                        self._wake_up(reason="scheduled task")
 
         # 2. If executing a goal, that's handled by the executor thread
         if self.state == CognitiveState.EXECUTING:
@@ -254,12 +306,9 @@ class CognitiveBrain:
                         self.memory.add_event("training",
                             f"Nightly training: {n_insights} insights, "
                             f"{report.get('kg_relations', 0)} knowledge relations")
-                        print(f"[Brain] Nightly training: {n_insights} insights absorbed")
+                        log.info("Nightly training: %d insights absorbed", n_insights)
                 except Exception as e:
-                    print(f"[Brain] Nightly training failed: {e}")
-
-            if self.dream_engine and self.dream_engine.should_dream():
-                self._dream_cycle()
+                    log.warning("Nightly training failed: %s", e)
 
             # Wake up naturally when fully rested
             if self._energy >= WAKE_THRESHOLD:
@@ -270,6 +319,8 @@ class CognitiveBrain:
         if self.state == CognitiveState.IDLE:
             self._idle_cycles += 1
             self._energy = max(0, self._energy - ENERGY_COST_TICK)
+
+            self._process_notifications()
 
             # Emit boredom after extended idling
             if self.behavior and self._idle_cycles > 0 and self._idle_cycles % 12 == 0:
@@ -292,15 +343,19 @@ class CognitiveBrain:
             elif self._idle_cycles > 0 and self._idle_cycles % TIMEPASS_INTERVAL == 0:
                 self._do_timepass()
 
+                # Opportunistic follow-up on unresolved dialogue items.
+                self._maybe_proactive_dialogue_follow_up()
+            self._maybe_personalized_suggestion()
+
     def _handle_due_scheduled_goal(self) -> bool:
-        """Dispatch one due scheduled goal, if available."""
+        """Dispatch one due scheduled goal on a background thread."""
         if not self.reasoning:
             return False
 
         try:
             scheduled = self.reasoning.dequeue_due_scheduled_goal()
         except Exception as e:
-            print(f"[Brain] Scheduled-goal dequeue failed: {e}")
+            log.warning("Scheduled-goal dequeue failed: %s", e)
             return False
 
         if not scheduled:
@@ -315,9 +370,44 @@ class CognitiveBrain:
             "scheduled_goal",
             f"Dispatching scheduled goal [{task_id}]: {goal}",
         )
-        self._say(f"Running scheduled task: {goal}")
-        self._execute_goal(goal)
+        self._say(f"Running scheduled task in background: {goal}")
+        self._scheduled_thread = threading.Thread(
+            target=self._run_scheduled_goal,
+            args=(goal,),
+            daemon=True,
+            name=f"scheduled-{task_id}",
+        )
+        self._scheduled_thread.start()
         return True
+
+    def _run_scheduled_goal(self, goal: str) -> None:
+        """Execute a scheduled goal on a background thread."""
+        try:
+            self.executor.execute_goal(goal)
+            success = self.executor.goal_completed
+            steps = len(self.executor.action_history)
+            reward = self._apply_reward_signal(goal, success, self.executor.action_history)
+            if success:
+                self.memory.add_event("action_result", f"Scheduled goal succeeded: {goal}")
+            else:
+                self.memory.add_event("action_result", f"Scheduled goal failed: {goal}")
+            self.memory.log_episode(goal, "completed" if success else "failed", steps, success)
+
+            if self.skill_graph and self.executor.action_history:
+                self.skill_graph.record_goal(
+                    goal,
+                    self.executor.action_history,
+                    success,
+                    reward_by_action=(reward or {}).get("per_action"),
+                )
+            if self.curiosity:
+                self.curiosity.mark_outcome(goal, success)
+        except Exception as e:
+            self.memory.add_event("action_result", f"Scheduled goal crashed: {goal} — {e}")
+            log.error("Scheduled goal error: %s", e)
+        finally:
+            # Clear reference so the thread object can be garbage-collected
+            self._scheduled_thread = None
 
     # ── User input handling ──────────────────────────────────────────
 
@@ -331,7 +421,13 @@ class CognitiveBrain:
     def _handle_user_input(self, user_input: str):
         """Process user speech — decide whether to chat, act, or both."""
         self.memory.add_event("user_speech", user_input)
-        print(f"[Brain] User said: {user_input}")
+        log.info("User said: %s", user_input)
+
+        if self.dialogue:
+            self.dialogue.ingest_user(user_input)
+        if self.preferences:
+            self.preferences.observe_user_text(user_input)
+        self._ingest_user_correction_signal(user_input)
 
         # Emotional reaction to user input
         if self.behavior:
@@ -343,6 +439,15 @@ class CognitiveBrain:
         action_type = decision.get("type", "chat")
         response = decision.get("response", "")
         goal = decision.get("goal", "")
+
+        # Record this exchange in the conversation buffer
+        self._conversation_buffer.append({"role": "user", "text": user_input})
+        if response:
+            self._conversation_buffer.append({"role": "assistant", "text": response})
+        # Trim to max turns (each turn = 2 entries)
+        max_entries = self._max_conversation_turns * 2
+        if len(self._conversation_buffer) > max_entries:
+            self._conversation_buffer = self._conversation_buffer[-max_entries:]
 
         # Learn user's name if mentioned
         if decision.get("user_name"):
@@ -407,6 +512,9 @@ class CognitiveBrain:
                 self._say(response)
             self._fall_asleep()
 
+        if self.dialogue and response:
+            self.dialogue.ingest_assistant(response)
+
     def _think_about_input(self, user_input: str) -> dict:
         """Use LLM to decide how to handle user input."""
         # Use world state context if available, otherwise build manually
@@ -423,6 +531,30 @@ class CognitiveBrain:
         if self.behavior:
             emotional_context = self.behavior.get_emotional_context()
 
+        # Build conversation history string from buffer
+        conversation_history = ""
+        if self._conversation_buffer:
+            lines = []
+            for entry in self._conversation_buffer:
+                role = "User" if entry["role"] == "user" else "You"
+                lines.append(f"{role}: {entry['text']}")
+            conversation_history = "\n".join(lines)
+
+        # Active project context
+        project_context = ""
+        if hasattr(self.memory, 'get_projects_summary'):
+            project_context = self.memory.get_projects_summary(3)
+
+        # Preference context
+        preference_context = ""
+        if self.preferences:
+            preference_context = self.preferences.summary(5)
+
+        # Dialogue state context
+        dialogue_context = ""
+        if self.dialogue:
+            dialogue_context = self.dialogue.get_context_summary(3)
+
         prompt = f"""{PERSONA}
 
 CURRENT STATE:
@@ -434,6 +566,15 @@ EMOTIONAL STATE:
 
 WORLD CONTEXT:
 {world_context}
+
+{f"ONGOING PROJECTS:{chr(10)}{project_context}" if project_context else ""}
+
+{f"PREFERENCES:{chr(10)}{preference_context}" if preference_context else ""}
+
+{f"DIALOGUE STATE:{chr(10)}{dialogue_context}" if dialogue_context else ""}
+
+RECENT CONVERSATION:
+{conversation_history if conversation_history else "(no prior conversation)"}
 
 The user just said: "{user_input}"
 
@@ -480,12 +621,12 @@ Rules:
             return result
 
         except Exception as e:
-            print(f"[Brain] Input analysis failed: {e}")
-            return {
-                "type": "action",
-                "response": f"Let me work on that.",
-                "goal": user_input,
-            }
+            log.warning("Input analysis failed: %s", e)
+            return self.local_fallback.analyze_user_input(
+                user_input,
+                context=prompt,
+                persona=PERSONA,
+            )
 
     # ── Goal execution ───────────────────────────────────────────────
 
@@ -495,6 +636,8 @@ Rules:
         self.current_goal = goal
         self._energy = max(0, self._energy - ENERGY_COST_GOAL)
         self.memory.add_event("action", f"Starting goal: {goal}")
+        if self.preferences:
+            self.preferences.observe_goal(goal)
 
         # Focus attention on the goal
         if self.attention:
@@ -519,6 +662,14 @@ Rules:
                 world_ctx = f"{world_ctx}\n\nLEARNED STRATEGIES:\n{strategy_ctx}"
             if skill_ctx:
                 world_ctx = f"{world_ctx}\n\nSKILL PROFILE:\n{skill_ctx}"
+
+            # Include active project context for continuity
+            project_ctx = ""
+            if hasattr(self.memory, 'get_projects_summary'):
+                project_ctx = self.memory.get_projects_summary(3)
+            if project_ctx:
+                world_ctx = f"{world_ctx}\n\n{project_ctx}"
+
             plan = self.reasoning.set_goal(goal, world_ctx)
             self.memory.add_event("thought",
                 f"Plan ({len(plan.steps)} steps): "
@@ -531,22 +682,42 @@ Rules:
             if success:
                 outcome = "completed successfully"
                 self.memory.add_event("action_result", f"Goal succeeded: {goal}")
+                if self.notifications:
+                    self.notifications.publish(
+                        f"Completed goal: {goal}",
+                        priority="normal",
+                        source="goal",
+                    )
                 if self.behavior:
                     self.behavior.emotion.react("goal_success", goal)
             else:
                 outcome = "did not complete (ran out of steps)"
                 self.memory.add_event("action_result", f"Goal failed: {goal}")
+                if self.notifications:
+                    self.notifications.publish(
+                        f"Goal failed: {goal}",
+                        priority="urgent",
+                        source="goal",
+                    )
                 if self.behavior:
                     self.behavior.emotion.react("goal_failure", goal)
 
             steps = len(self.executor.action_history)
             self.memory.log_episode(goal, outcome, steps, success)
 
+            reward = self._apply_reward_signal(goal, success, self.executor.action_history)
+
             # Update skill graph with action outcomes
             if self.skill_graph and self.executor.action_history:
                 self.skill_graph.record_goal(
-                    goal, self.executor.action_history, success,
+                    goal,
+                    self.executor.action_history,
+                    success,
+                    reward_by_action=(reward or {}).get("per_action"),
                 )
+
+            if self.curiosity:
+                self.curiosity.mark_outcome(goal, success)
 
             # Log episode summary for the learning subsystem
             if hasattr(self.executor, 'exp_logger'):
@@ -557,6 +728,9 @@ Rules:
 
             # Reflect on what happened
             self._reflect_on_outcome(goal, success, steps)
+
+            if self.dialogue:
+                self.dialogue.resolve_by_goal(goal, success)
 
         except Exception as e:
             self.memory.add_event("action_result", f"Goal crashed: {goal} — {e}")
@@ -628,6 +802,71 @@ Output ONLY valid JSON."""
         except Exception:
             pass  # reflection is best-effort
 
+    def _apply_reward_signal(self, goal: str, success: bool,
+                             action_history: list[dict]) -> dict:
+        """Evaluate and distribute reward signals to learning subsystems."""
+        if not self.reward_engine:
+            return {}
+        try:
+            reward = self.reward_engine.evaluate_goal(
+                goal=goal,
+                action_history=action_history or [],
+                success=success,
+            )
+            self.memory.add_event(
+                "reward",
+                f"Goal '{goal}' reward total={reward.get('total', 0.0)}",
+            )
+
+            if self.self_improver:
+                self.self_improver.record_strategy_outcome(
+                    goal=goal,
+                    success=success,
+                    reward_total=float(reward.get("total", 0.0)),
+                )
+            return reward
+        except Exception as e:
+            log.warning("Reward evaluation failed: %s", e)
+            return {}
+
+    def _ingest_user_correction_signal(self, user_input: str) -> None:
+        """Detect user corrections and route them into learning datasets."""
+        text = (user_input or "").strip()
+        if not text:
+            return
+
+        patterns = [
+            r"\bno\b\s*,?\s*i meant\s+(.+)",
+            r"\bno\b\s*,?\s*do\s+(.+)\s+instead",
+            r"\bthat's wrong\b\s*[,\-:]?\s*(.+)",
+        ]
+        corrected = ""
+        for p in patterns:
+            m = re.search(p, text, flags=re.IGNORECASE)
+            if m:
+                corrected = (m.group(1) or "").strip()
+                break
+
+        if not corrected:
+            return
+
+        previous_intent = ""
+        if self._conversation_buffer:
+            for entry in reversed(self._conversation_buffer):
+                if entry.get("role") == "user":
+                    previous_intent = entry.get("text", "")
+                    break
+
+        if hasattr(self.executor, "exp_logger") and self.executor.exp_logger:
+            try:
+                self.executor.exp_logger.log_user_correction(
+                    input_text=text,
+                    previous_intent=previous_intent,
+                    corrected_intent=corrected,
+                )
+            except Exception:
+                pass
+
     # ── Sleep / wake cycle ────────────────────────────────────────────
 
     def _fall_asleep(self):
@@ -636,7 +875,7 @@ Output ONLY valid JSON."""
         self._idle_cycles = 0
         self._nightly_trained_this_sleep = False
         self.memory.add_event("system", "Falling asleep")
-        print(f"[Brain] Falling asleep... (energy: {self._energy:.0f}%)")
+        log.info("Falling asleep... (energy: %.0f%%)", self._energy)
         self._say("I'm feeling tired... going to rest for a bit.")
 
         if self.dream_engine:
@@ -655,7 +894,7 @@ Output ONLY valid JSON."""
 
         if was_sleeping:
             self.memory.add_event("system", f"Waking up (reason: {reason})")
-            print(f"[Brain] Waking up ({reason})")
+            log.info("Waking up (%s)", reason)
 
             # Share a dream if one just happened
             last_dream = self.dream_engine.get_last_dream() if self.dream_engine else None
@@ -668,18 +907,42 @@ Output ONLY valid JSON."""
             if self.behavior:
                 self.behavior.emotion.react("user_return", "waking up")
 
+            # Check active projects and offer to resume
+            self._check_active_projects()
+
+    def _check_active_projects(self):
+        """On wake, check for unfinished projects and resume the top-priority one."""
+        if not hasattr(self.memory, 'get_active_projects'):
+            return
+        projects = self.memory.get_active_projects()
+        if not projects:
+            return
+
+        # Sort by priority (descending), then creation time
+        projects.sort(key=lambda p: (-p.get("priority", 0), p.get("created_at", 0)))
+        top = projects[0]
+        goal = top.get("goal", "")
+        pct = int(top.get("progress", 0) * 100)
+
+        if goal:
+            self._say(f"I have an ongoing project: {goal} ({pct}% done). "
+                      f"Resuming it now.")
+            self.memory.add_event("project_resume",
+                                  f"Resuming project: {goal} ({pct}%)")
+            self._execute_goal(goal)
+
     # ── Dreaming ─────────────────────────────────────────────────────
 
     def _dream_cycle(self):
         """Run a dream cycle during sleep."""
-        print("[Brain] Dreaming...")
+        log.debug("Dreaming...")
 
         if self.behavior:
             self.behavior.emotion.react("interesting_observation", "dreaming")
 
         dream = self.dream_engine.dream()
         if not dream:
-            print("[Brain] Dream faded (not enough material).")
+            log.debug("Dream faded (not enough material).")
             return
 
         narrative = dream.get("narrative", "")
@@ -688,11 +951,46 @@ Output ONLY valid JSON."""
 
         self.memory.add_event("dream",
             f"Dreamed about: {theme}. {narrative}")
-        print(f"[Brain] Dream: [{theme}] {narrative}")
+        log.info("Dream: [%s] %s", theme, narrative)
 
         if insights:
             for insight in insights[:3]:
-                print(f"[Brain] Dream insight: {insight}")
+                log.info("Dream insight: %s", insight)
+
+    def _maybe_proactive_dialogue_follow_up(self) -> None:
+        """Occasionally follow up on unresolved questions or promises."""
+        if not self.dialogue:
+            return
+        follow_up = self.dialogue.next_follow_up(min_interval_sec=300)
+        if follow_up:
+            self.memory.add_event("dialogue_follow_up", follow_up)
+            self._say(follow_up)
+
+    def _maybe_personalized_suggestion(self) -> None:
+        """Offer preference-based suggestions only at strong confidence."""
+        if not self.preferences:
+            return
+        suggestion = self.preferences.maybe_suggestion()
+        if suggestion:
+            self.memory.add_event("personalization", suggestion)
+            self._say(suggestion)
+
+    def _process_notifications(self) -> None:
+        """Ingest system events and speak eligible queued notifications."""
+        if not self.notifications:
+            return
+
+        if self.world_state:
+            try:
+                system_state = self.world_state.get_channel("system")
+                self.notifications.ingest_system_snapshot(system_state)
+            except Exception:
+                pass
+
+        note = self.notifications.next_for_state(self.state.name)
+        if note:
+            self.memory.add_event("notification", f"[{note.priority}] {note.message}")
+            self._say(note.message)
 
     # ── Autonomous thinking ──────────────────────────────────────────
 
@@ -743,7 +1041,7 @@ Output ONLY valid JSON."""
                 pass
 
         self.memory.add_event("timepass", activity)
-        print(f"[Brain] ~ {activity}")
+        log.debug("~ %s", activity)
 
         # Occasionally say it aloud (10% chance)
         if random.random() < 0.1:
@@ -812,8 +1110,12 @@ Output ONLY valid JSON."""
                               knowledge_context)
 
         # ── Step 2: Curiosity-driven goal generation ─────────────
+        # Only trigger curiosity goals if user has been idle for >= 1 hour
         if self.curiosity and self.behavior:
-            if self.behavior.should_self_initiate():
+            user_idle_seconds = self.idle_monitor.idle_seconds() if self.idle_monitor else 0
+            user_is_idle_1hr = user_idle_seconds >= 3600
+            
+            if user_is_idle_1hr and self.behavior.should_self_initiate():
                 self._curiosity_goal_cycle(observation, world_context)
 
     def _inner_monologue(self, observation: str, world_context: str,
@@ -886,7 +1188,7 @@ Rules:
             thought = result.get("thought", "")
             if thought:
                 self.memory.add_event("thought", thought)
-                print(f"[Brain] 💭 {thought}")
+                log.info("💭 %s", thought)
 
             speak = result.get("speak", "")
             if speak:
@@ -908,10 +1210,14 @@ Rules:
                         self.memory.add_knowledge(s, r, o, confidence=0.6)
 
         except Exception as e:
-            print(f"[Brain] Inner monologue failed: {e}")
+            log.warning("Inner monologue failed: %s", e)
 
     def _curiosity_goal_cycle(self, observation: str, world_context: str):
-        """Ask the curiosity engine to generate a goal and pursue it."""
+        """Ask the curiosity engine to generate a goal and pursue it.
+        
+        This is only called when user has been idle for >= 1 hour, so goals
+        will execute in the foreground (safe to browse/research).
+        """
         candidate = self.curiosity.generate_goal(observation, world_context)
 
         if not candidate:
@@ -930,7 +1236,7 @@ Rules:
         self.memory.add_event("curiosity",
             f"Generated goal: \"{goal}\" (reason: {reason}, "
             f"source: {source}, score: {score:.2f})")
-        print(f"[Brain] 🔍 Curiosity goal: {goal} (score={score:.2f}, reason={reason})")
+        log.info("🔍 Curiosity goal: %s (score=%.2f, reason=%s)", goal, score, reason)
 
         # Trigger curiosity emotion
         if self.behavior:
@@ -943,12 +1249,15 @@ Rules:
         if announce:
             self._say(announce)
 
+        # Safe to run in foreground — user is idle >= 1 hour
         self._execute_goal(goal)
 
         # After execution, update curiosity with outcome
         if self.curiosity:
             success = self.executor.goal_completed if self.executor else False
             self.curiosity.mark_outcome(goal, success, topic)
+
+    # ── Old background execution removed (no longer needed) ────────
 
     def _generate_curiosity_announcement(self, goal: str, reason: str) -> str:
         """Generate a natural announcement for a self-initiated goal."""
@@ -1034,11 +1343,11 @@ Rules:
 
             except Exception as e:
                 # Fall back to just window info
-                print(f"[Brain] Vision observation failed: {e}")
+                log.debug("Vision observation failed: %s", e)
                 return window_info or "Screen observation unavailable."
 
         except Exception as e:
-            print(f"[Brain] Screenshot failed: {e}")
+            log.debug("Screenshot failed: %s", e)
             return ""
 
     # ── Utilities ────────────────────────────────────────────────────
@@ -1136,11 +1445,30 @@ Rules:
         """Send text to TTS queue so the AI speaks it aloud."""
         if not text:
             return
-        print(f"[Brain] 🗣 {text}")
+        log.info("🗣 %s", text)
         self.memory.add_event("action", f"Said: {text}")
+        # Get smoothed dominant emotion for expressive speech.
+        emotion = None
+        style = None
+        if self.behavior:
+            try:
+                dominant = self.behavior.emotion.dominant()
+                if dominant:
+                    intensity = self.behavior.emotion.intensity_of(dominant)
+                    # Keep last voice unless new emotion is strong enough.
+                    if intensity >= 0.35 or not self._last_speech_emotion:
+                        self._last_speech_emotion = dominant
+                emotion = self._last_speech_emotion
+                style = self.behavior.get_speaking_style()
+            except Exception:
+                pass
         try:
+            if emotion or style:
+                item = (text, emotion, style)
+            else:
+                item = text
             if not self.tts_queue.full():
-                self.tts_queue.put(text)
+                self.tts_queue.put(item)
         except Exception:
             pass
 
@@ -1149,7 +1477,17 @@ Rules:
         # Instead of going through the old intent→goal pipeline,
         # put it on the goal queue for the brain to handle
         try:
-            if not self.goal_queue.full():
-                self.goal_queue.put(text)
+            self.goal_queue.put_nowait(text)
+        except Full:
+            try:
+                self.goal_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.goal_queue.put_nowait(text)
+            except Full:
+                pass
         except Exception:
             pass
+        finally:
+            self._input_event.set()

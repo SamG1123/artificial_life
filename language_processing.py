@@ -3,6 +3,7 @@ import spacy
 import textblob as tb
 from transformers import pipeline
 from image_processing import ObjectDetection
+from queue import Empty, Full
 from config import global_command_queue, global_goal_queue
 
 class LanguageProcessor:
@@ -66,11 +67,19 @@ class LanguageProcessor:
         elif intent in ("PC_CONTROL", "MEDIA_CONTROL", "TASK_MANAGEMENT",
                          "CREATIVE", "SYSTEM_CONTROL"):
             # Every actionable intent goes to the unified executor
-            if not global_goal_queue.full():
-                global_goal_queue.put(text)
+            try:
+                global_goal_queue.put_nowait(text)
                 return f"Got it, working on: {text}"
-            else:
-                return "I'm busy with another task, please wait."
+            except Full:
+                try:
+                    global_goal_queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    global_goal_queue.put_nowait(text)
+                    return f"Got it, working on: {text}"
+                except Full:
+                    return "I'm busy with another task, please wait."
 
         elif intent == "VISION_QUERY":
             # Use the latest camera frame for the vision query

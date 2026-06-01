@@ -95,6 +95,19 @@ class ExperienceLogger:
         }
         self._write(entry)
 
+    def log_user_correction(self, input_text: str,
+                            previous_intent: str,
+                            corrected_intent: str):
+        """Log explicit user corrections for supervised correction learning."""
+        entry = {
+            "ts": time.time(),
+            "type": "user_correction",
+            "input_text": (input_text or "")[:400],
+            "previous_intent": (previous_intent or "")[:300],
+            "corrected_intent": (corrected_intent or "")[:300],
+        }
+        self._write(entry)
+
     def get_log_files(self) -> list[Path]:
         """Return all .jsonl.gz log files sorted newest-first."""
         files = sorted(self._dir.glob("*.jsonl.gz"), reverse=True)
