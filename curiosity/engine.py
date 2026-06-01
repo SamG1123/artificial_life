@@ -39,7 +39,8 @@ load_dotenv()
 class CuriosityEngine:
     """Generates autonomous goals from intrinsic motivation."""
 
-    def __init__(self, memory, behavior, store_dir: str = "memory_store"):
+    def __init__(self, memory, behavior, store_dir: str = "memory_store",
+                 skill_graph=None):
         """
         Args:
             memory:   MemorySystem instance (episodic + semantic + short-term)
@@ -48,6 +49,7 @@ class CuriosityEngine:
         """
         self.memory = memory
         self.behavior = behavior
+        self.skill_graph = skill_graph
 
         self._store_file = os.path.join(store_dir, "curiosity_state.json")
         self._lock = Lock()
@@ -306,12 +308,16 @@ Rules:
                         repetition_penalty = 0.4
                         break
 
+            # Reward trend bonus from related skills.
+            reward_bonus = self._reward_bonus_for_candidate(c)
+
             # Final score
             score = (
                 novelty * 0.35 +
                 importance * 0.25 +
                 curiosity_trait * 0.20 +
-                interest_bonus * 0.20 -
+                interest_bonus * 0.15 +
+                reward_bonus * 0.10 -
                 repetition_penalty
             )
 
@@ -327,6 +333,28 @@ Rules:
         if best and best["score"] >= min_threshold:
             return best
         return None
+
+    def _reward_bonus_for_candidate(self, candidate: dict) -> float:
+        """Prefer candidates tied to skills with improving reward curves."""
+        if self.skill_graph is None:
+            return 0.0
+
+        goal_text = str(candidate.get("goal", "")).lower()
+        topic_text = str(candidate.get("interest_topic", "")).lower()
+        text = f"{goal_text} {topic_text}"
+
+        bonuses = []
+        for node in self.skill_graph.all_skills():
+            name = node.name.replace("_", " ")
+            if name in text and node.reward_history:
+                recent = node.reward_history[-10:]
+                avg = sum(recent) / len(recent)
+                # Map roughly from [-0.5, 0.5] -> [0,1]
+                bonuses.append(max(0.0, min(1.0, (avg + 0.5))))
+
+        if not bonuses:
+            return 0.0
+        return sum(bonuses) / len(bonuses)
 
     # ── Interest / question management ───────────────────────────
 

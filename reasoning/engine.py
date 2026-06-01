@@ -40,7 +40,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
-from .planner import Planner, Plan, Step
+from .planner import Planner, Plan, Step, TaskNode
 from .policy import BasePolicy, LLMPolicy
 
 
@@ -280,21 +280,61 @@ class ReasoningEngine:
                 cur = self._current_plan.current_step
                 if cur:
                     cur.complete(result)
+                # Propagate leaf status up the task tree
+                for root in self._current_plan.task_tree:
+                    root.propagate_status()
         else:
             self._consecutive_failures += 1
             if self._current_plan:
                 cur = self._current_plan.current_step
                 if cur:
                     cur.fail(result)
+                # Propagate failure up the tree
+                for root in self._current_plan.task_tree:
+                    root.propagate_status()
 
-            # Auto-replan after consecutive failures
+            # Try subtask repair first, then full replan
             if (self._consecutive_failures >= self.CONSECUTIVE_FAIL_REPLAN
                     and self._replan_count < self.MAX_REPLAN_ATTEMPTS
                     and self._current_plan):
-                self._do_replan(
+                repaired = self._try_subtask_repair(
                     f"Last {self._consecutive_failures} actions failed",
                     world_context,
                 )
+                if not repaired:
+                    self._do_replan(
+                        f"Last {self._consecutive_failures} actions failed",
+                        world_context,
+                    )
+
+    def _try_subtask_repair(self, reason: str,
+                            world_context: str) -> bool:
+        """Attempt to repair only the failed subtask branch.
+
+        Returns True if repair was applied, False if full replan needed.
+        """
+        if not self._current_plan or not self._current_plan.task_tree:
+            return False
+
+        # Find failed non-leaf subtask nodes
+        failed_nodes: list[TaskNode] = []
+        for root in self._current_plan.task_tree:
+            failed_nodes.extend(root.failed_subtasks())
+
+        if not failed_nodes:
+            return False
+
+        # Repair the first (most shallow) failed subtask
+        target = failed_nodes[0]
+        success = self.planner.repair_subtask(
+            self._current_plan, target.id, reason, world_context,
+        )
+        if success:
+            self._consecutive_failures = 0
+            self._replan_count += 1
+            print(f"[ReasoningEngine] Repaired subtask '{target.title}' "
+                  f"({self._replan_count}/{self.MAX_REPLAN_ATTEMPTS})")
+        return success
 
     def request_replan(self, reason: str,
                        world_context: str = "") -> Plan | None:

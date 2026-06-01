@@ -25,6 +25,7 @@ from typing import Any
 
 from groq import Groq
 from dotenv import load_dotenv
+from local_fallback import LocalFallbackModel
 
 load_dotenv()
 
@@ -87,6 +88,7 @@ class LLMPolicy(BasePolicy):
 
     def __init__(self):
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.local_fallback = LocalFallbackModel()
 
         # OS context (same as old ReasoningModel)
         self._os_info = f"Windows ({os.name})" if os.name == "nt" else os.name
@@ -94,6 +96,10 @@ class LLMPolicy(BasePolicy):
                                         os.environ.get("USER", "user"))
         self._home_dir = os.path.expanduser("~").replace("/", os.sep)
         self._desktop_dir = os.path.join(self._home_dir, "Desktop")
+        # Prompt safety limits to avoid token exhaustion in long screens
+        self.PROMPT_CHAR_LIMIT = int(os.getenv("PROMPT_CHAR_LIMIT", "12000"))
+        self.MAX_ELEMENTS_IN_PROMPT = int(os.getenv("MAX_ELEMENTS_IN_PROMPT", "30"))
+        self.MAX_ELEMENT_TEXT = int(os.getenv("MAX_ELEMENT_TEXT", "60"))
 
     # ── Public interface ─────────────────────────────────────────
 
@@ -141,7 +147,15 @@ class LLMPolicy(BasePolicy):
             return self._parse(resp.choices[0].message.content)
         except Exception as e:
             print(f"[LLMPolicy] Text query failed: {e}")
-            return {"action": "done"}
+            return self.local_fallback.select_action(
+                goal,
+                elements,
+                history_context,
+                screenshot_b64=screenshot_b64,
+                screen_resolution=screen_resolution,
+                plan_context=plan_context,
+                emotional_context=emotional_context,
+            )
 
     # ── Vision query (desktop mode) ──────────────────────────────
 
@@ -175,18 +189,31 @@ class LLMPolicy(BasePolicy):
             return self._parse(resp.choices[0].message.content)
         except Exception as e:
             print(f"[LLMPolicy] Vision query failed: {e}, falling back to text")
-            return self._query_text(goal, elements, user_context,
-                                    plan_context, emotional_context)
+            fallback = self.local_fallback.select_action(
+                goal,
+                elements,
+                user_context,
+                screenshot_b64=screenshot_b64,
+                screen_resolution=screen_resolution,
+                plan_context=plan_context,
+                emotional_context=emotional_context,
+            )
+            return fallback
 
     # ── Prompt builders ──────────────────────────────────────────
 
     def _build_text_prompt(self, goal: str, elements: list[dict],
                            plan_context: str,
                            emotional_context: str) -> str:
+        # Compact elements to a reasonable number to avoid huge prompts
+        compact = elements[: self.MAX_ELEMENTS_IN_PROMPT]
+        def _short(el_text: str) -> str:
+            return (el_text or "")[: self.MAX_ELEMENT_TEXT]
+
         element_list = "\n".join(
-            f"[{e['id']}] ({e['type']}) \"{e['text'][:80]}\""
+            f"[{e['id']}] ({e['type']}) \"{_short(e.get('text',''))}\""
             + (f"  href={e['href']}" if e.get("href") else "")
-            for e in elements
+            for e in compact
         )
 
         sections = [self._core_rules(), f"GOAL:\n{goal}"]
@@ -195,17 +222,30 @@ class LLMPolicy(BasePolicy):
         if emotional_context:
             sections.insert(1, f"AGENT STATE:\n{emotional_context}")
         sections.append(f"VISIBLE ELEMENTS:\n{element_list}")
-        return "\n\n".join(sections)
+        prompt = "\n\n".join(sections)
+        # Ensure the system prompt is not excessively long — trim elements if needed
+        if len(prompt) > self.PROMPT_CHAR_LIMIT:
+            # Remove the VISIBLE ELEMENTS section entirely if still too long
+            parts = prompt.split("VISIBLE ELEMENTS:")
+            if len(parts) >= 2:
+                prompt = parts[0] + "VISIBLE ELEMENTS:\n(too many elements to include)"
+            # hard cap
+            prompt = prompt[: self.PROMPT_CHAR_LIMIT]
+        return prompt
 
     def _build_vision_prompt(self, goal: str, elements: list[dict],
                              screen_resolution: tuple[int, int],
                              plan_context: str,
                              emotional_context: str) -> str:
         w, h = screen_resolution
+        compact = elements[: self.MAX_ELEMENTS_IN_PROMPT]
+        def _short(el_text: str) -> str:
+            return (el_text or "")[: self.MAX_ELEMENT_TEXT]
+
         element_list = "\n".join(
-            f"[{e['id']}] ({e['type']}) \"{e['text'][:60]}\" "
+            f"[{e['id']}] ({e['type']}) \"{_short(e.get('text',''))}\" "
             f"at pixel ({e['center'][0]},{e['center'][1]})"
-            for e in elements
+            for e in compact
         )
 
         sections = [
@@ -220,7 +260,14 @@ class LLMPolicy(BasePolicy):
             f"OCR-detected text on screen (with pixel coordinates):\n"
             f"{element_list or '(no text detected)'}"
         )
-        return "\n\n".join(sections)
+        prompt = "\n\n".join(sections)
+        if len(prompt) > self.PROMPT_CHAR_LIMIT:
+            # Trim the OCR block to avoid overflowing token limits
+            parts = prompt.split("OCR-detected text on screen")
+            if len(parts) >= 2:
+                prompt = parts[0] + "OCR-detected text on screen:\n(omitted long OCR output)"
+            prompt = prompt[: self.PROMPT_CHAR_LIMIT]
+        return prompt
 
     def _core_rules(self, *, vision: bool = False,
                     resolution: str = "") -> str:

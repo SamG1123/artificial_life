@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    volumes:
+      - ./memory_store:/app/memory_store
+    restart: unless-stopped
+  demo_light:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    ports:
+      - "8001:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    volumes:
+      - ./memory_store:/app/memory_store
+    restart: unless-stopped

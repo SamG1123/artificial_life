@@ -13,7 +13,10 @@ Verdicts:
     BLOCK   – refuse to execute
 """
 
+import json
+import os
 import re
+import time
 from enum import Enum
 
 
@@ -60,19 +63,46 @@ _DANGEROUS_HOTKEYS = [
     ({"ctrl", "shift", "delete"}, "security screen"),
 ]
 
+# Auto-allow threshold: after N user confirmations of the same pattern,
+# bypass the confirmation prompt.
+_AUTO_ALLOW_THRESHOLD = 3
+
 
 class SafetyValidator:
-    """Validates actions before execution to prevent dangerous operations."""
+    """Validates actions before execution to prevent dangerous operations.
 
-    def __init__(self):
+    Supports context-aware risk assessment and remembers user confirmations
+    so frequently-approved patterns don't nag repeatedly.
+    """
+
+    def __init__(self, store_dir: str = "memory_store"):
         self._blocked = 0
         self._confirmed = 0
         self._patterns = [re.compile(p, re.IGNORECASE) for p in _DANGEROUS_COMMANDS]
 
+        # Confirmation memory: {action_signature: confirmation_count}
+        self._confirm_cache: dict[str, int] = {}
+        self._decision_log: list[dict] = []
+
+        # Persistent confirmation cache path
+        self._cache_path = os.path.join(store_dir, "safety_confirmations.json")
+        self._load_cache()
+
     # ── public API ──────────────────────────────────────────────────
 
-    def validate(self, action_dict: dict) -> tuple:
+    def validate(self, action_dict: dict, *,
+                 goal_context: str = "",
+                 world_context: str = "") -> tuple:
         """Check an action for safety.
+
+        Parameters
+        ----------
+        action_dict : dict
+            The action to validate.
+        goal_context : str
+            The current goal being pursued (for context-aware decisions).
+        world_context : str
+            Summary of the current world state.
 
         Returns (SafetyVerdict, RiskLevel, reason_str).
         """
@@ -82,9 +112,25 @@ class SafetyValidator:
             return SafetyVerdict.ALLOW, RiskLevel.SAFE, ""
 
         if action == "run_command":
-            return self._check_command(action_dict.get("command", ""))
+            verdict, risk, reason = self._check_command(action_dict.get("command", ""))
+            # Context-aware downgrade: if the goal clearly involves
+            # the action type, reduce risk for CONFIRM verdicts
+            if verdict == SafetyVerdict.CONFIRM and goal_context:
+                sig = self._action_signature(action_dict)
+                if self._is_auto_allowed(sig):
+                    self._log_decision(action_dict, SafetyVerdict.ALLOW,
+                                       risk, "auto-allowed (confirmed before)",
+                                       goal_context)
+                    return SafetyVerdict.ALLOW, risk, "auto-allowed"
+            return verdict, risk, reason
 
         if action == "download":
+            sig = self._action_signature(action_dict)
+            if self._is_auto_allowed(sig):
+                self._log_decision(action_dict, SafetyVerdict.ALLOW,
+                                   RiskLevel.HIGH, "auto-allowed download",
+                                   goal_context)
+                return SafetyVerdict.ALLOW, RiskLevel.HIGH, "auto-allowed download"
             return SafetyVerdict.CONFIRM, RiskLevel.HIGH, "File download requires confirmation"
 
         if action == "hotkey":
@@ -103,9 +149,38 @@ class SafetyValidator:
         # Unknown action — allow but flag
         return SafetyVerdict.ALLOW, RiskLevel.MEDIUM, f"Unknown action: {action}"
 
+    def record_confirmation(self, action_dict: dict, confirmed: bool) -> None:
+        """Record a user confirmation/rejection for learning.
+
+        After _AUTO_ALLOW_THRESHOLD confirmations of the same pattern,
+        future identical actions will auto-allow.
+        """
+        sig = self._action_signature(action_dict)
+        if confirmed:
+            self._confirmed += 1
+            self._confirm_cache[sig] = self._confirm_cache.get(sig, 0) + 1
+            self._save_cache()
+        else:
+            # User rejected — remove from cache if present
+            self._confirm_cache.pop(sig, None)
+            self._save_cache()
+
     @property
     def stats(self) -> dict:
-        return {"blocked": self._blocked, "confirmed": self._confirmed}
+        return {
+            "blocked": self._blocked,
+            "confirmed": self._confirmed,
+            "auto_allowed_patterns": sum(
+                1 for v in self._confirm_cache.values()
+                if v >= _AUTO_ALLOW_THRESHOLD
+            ),
+            "recent_decisions": len(self._decision_log),
+        }
+
+    @property
+    def decision_log(self) -> list[dict]:
+        """Recent safety decisions (for learning/analysis)."""
+        return list(self._decision_log[-100:])
 
     # ── private helpers ─────────────────────────────────────────────
 
@@ -147,3 +222,60 @@ class SafetyValidator:
                 )
 
         return SafetyVerdict.ALLOW, RiskLevel.LOW, ""
+
+    @staticmethod
+    def _action_signature(action_dict: dict) -> str:
+        """Create a stable signature for an action type (ignoring volatile fields)."""
+        action = action_dict.get("action", "")
+        # For commands, normalize whitespace
+        if action == "run_command":
+            cmd = action_dict.get("command", "").strip()
+            # Extract the command verb (first token)
+            verb = cmd.split()[0] if cmd else ""
+            return f"run_command:{verb}"
+        if action == "download":
+            return "download"
+        if action == "hotkey":
+            keys = sorted(k.lower() for k in action_dict.get("keys", []))
+            return f"hotkey:{'+'.join(keys)}"
+        return action
+
+    def _is_auto_allowed(self, signature: str) -> bool:
+        """Check if this action signature has enough confirmations to auto-allow."""
+        return self._confirm_cache.get(signature, 0) >= _AUTO_ALLOW_THRESHOLD
+
+    def _log_decision(self, action_dict: dict, verdict: SafetyVerdict,
+                      risk: RiskLevel, reason: str,
+                      goal_context: str = "") -> None:
+        """Record a safety decision for analysis/learning."""
+        entry = {
+            "timestamp": time.time(),
+            "action": action_dict.get("action", ""),
+            "verdict": verdict.value,
+            "risk": risk.name,
+            "reason": reason,
+            "goal": goal_context[:100] if goal_context else "",
+        }
+        self._decision_log.append(entry)
+        # Keep bounded
+        if len(self._decision_log) > 500:
+            self._decision_log = self._decision_log[-300:]
+
+    def _load_cache(self) -> None:
+        if not os.path.exists(self._cache_path):
+            return
+        try:
+            with open(self._cache_path, "r", encoding="utf-8") as f:
+                self._confirm_cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            self._confirm_cache = {}
+
+    def _save_cache(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+            tmp = self._cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._confirm_cache, f, indent=2)
+            os.replace(tmp, self._cache_path)
+        except OSError:
+            pass

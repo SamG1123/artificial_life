@@ -149,6 +149,18 @@ class PerceptionManager:
         with self._lock:
             return dict(self._world_state)
 
+    def get_current_app_state(self) -> dict:
+        """Return current app state extracted by screen perception, if available."""
+        with self._lock:
+            ws = dict(self._world_state)
+        return ((ws.get("screen") or {}).get("data", {}) or {}).get("app_state", {})
+
+    def get_screen_change_events(self) -> list[str]:
+        """Return latest screen change events, if available."""
+        with self._lock:
+            ws = dict(self._world_state)
+        return ((ws.get("screen") or {}).get("data", {}) or {}).get("change_events", [])
+
     # ── Background loop ──────────────────────────────────────────
 
     def start_background_loop(

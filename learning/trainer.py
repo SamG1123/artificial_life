@@ -199,6 +199,27 @@ class ModelTrainer:
         print(f"[ModelTrainer] Reasoning stub — {episode_count} episodes logged → {out_dir}")
         return meta
 
+    def train_correction_classifier(
+        self,
+        dataset_path: str,
+        run_name: str = "",
+        epochs: int = 6,
+        batch_size: int = 16,
+        learning_rate: float = 3e-5,
+    ) -> dict:
+        """Train a classifier to map user correction text to corrected intent label."""
+        if not run_name:
+            run_name = f"correction_clf_{time.strftime('%Y%m%d_%H%M%S')}"
+        return self.train_action_classifier(
+            dataset_path=dataset_path,
+            run_name=run_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            text_col="input_text",
+            label_col="corrected_intent",
+        )
+
     def list_runs(self) -> list[dict]:
         """Return metadata for all training runs."""
         runs = []

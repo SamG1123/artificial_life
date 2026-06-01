@@ -79,7 +79,7 @@ class SkillNode:
 
     __slots__ = (
         "name", "category", "xp", "uses", "successes", "failures",
-        "last_used", "dependencies", "unlocked", "metadata",
+        "last_used", "dependencies", "unlocked", "metadata", "reward_history",
     )
 
     def __init__(
@@ -100,6 +100,7 @@ class SkillNode:
         self.dependencies = dependencies or []
         self.unlocked = len(self.dependencies) == 0
         self.metadata = metadata or {}
+        self.reward_history: list[float] = []
 
     @property
     def proficiency(self) -> float:
@@ -111,7 +112,13 @@ class SkillNode:
         """Discrete level derived from XP."""
         return self.xp // _XP_LEVEL_BASE
 
-    def record(self, success: bool) -> None:
+    @property
+    def avg_reward(self) -> float:
+        if not self.reward_history:
+            return 0.0
+        return sum(self.reward_history) / len(self.reward_history)
+
+    def record(self, success: bool, reward: float = 0.0) -> None:
         self.uses += 1
         if success:
             self.successes += 1
@@ -119,6 +126,8 @@ class SkillNode:
         else:
             self.failures += 1
             self.xp += _XP_FAILURE
+        self.reward_history.append(float(reward))
+        self.reward_history = self.reward_history[-100:]
         self.last_used = time.time()
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +144,8 @@ class SkillNode:
             "dependencies": self.dependencies,
             "unlocked": self.unlocked,
             "metadata": self.metadata,
+            "avg_reward": round(self.avg_reward, 3),
+            "reward_history": [round(r, 3) for r in self.reward_history[-20:]],
         }
 
     def __repr__(self) -> str:
@@ -166,7 +177,8 @@ class SkillGraph:
 
     # ── Public API ───────────────────────────────────────────────
 
-    def record_action(self, action: str, success: bool, goal: str = "") -> SkillNode | None:
+    def record_action(self, action: str, success: bool, goal: str = "",
+                      reward: float = 0.0) -> SkillNode | None:
         """Record an action execution, updating the corresponding skill.
 
         Returns the updated SkillNode, or None if the action has no
@@ -179,14 +191,15 @@ class SkillGraph:
         skill_name, category = mapping
         with self._lock:
             node = self._get_or_create(skill_name, category)
-            node.record(success)
+            node.record(success, reward=reward)
             self._check_unlocks()
             self._dirty = True
 
         self._save()
         return node
 
-    def record_goal(self, goal: str, actions: list[dict], success: bool) -> dict:
+    def record_goal(self, goal: str, actions: list[dict], success: bool,
+                    reward_by_action: list[dict] | None = None) -> dict:
         """Record the outcome of a full goal execution.
 
         Parameters
@@ -200,12 +213,18 @@ class SkillGraph:
 
         Returns a summary dict of skills touched.
         """
+        reward_map: dict[str, list[float]] = {}
+        for ra in (reward_by_action or []):
+            reward_map.setdefault(ra.get("action", ""), []).append(float(ra.get("reward", 0.0)))
+
         touched: dict[str, dict] = {}
         for act_dict in actions:
             act_name = act_dict.get("action", "")
             act_result = act_dict.get("result", "")
             act_success = success or not str(act_result).startswith("FAILED")
-            node = self.record_action(act_name, act_success, goal)
+            reward_vals = reward_map.get(act_name, [])
+            act_reward = reward_vals.pop(0) if reward_vals else 0.0
+            node = self.record_action(act_name, act_success, goal, reward=act_reward)
             if node:
                 touched[node.name] = node.to_dict()
         return touched
@@ -315,7 +334,7 @@ class SkillGraph:
 
         if top:
             lines.append("Best skills: " + ", ".join(
-                f"{s.name} ({s.proficiency:.0%} lv{s.level})" for s in top
+                f"{s.name} ({s.proficiency:.0%} lv{s.level}, r={s.avg_reward:+.2f})" for s in top
             ))
         if weak:
             lines.append("Weakest skills: " + ", ".join(

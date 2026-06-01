@@ -14,6 +14,7 @@ from .trainer import ModelTrainer
 from .self_improver import SelfImprover
 from .skill_graph import SkillGraph, SkillNode
 from .nightly_trainer import NightlyTrainer
+from .reward import RewardEngine
 
 __all__ = [
     "ExperienceLogger",
@@ -23,4 +24,5 @@ __all__ = [
     "SkillGraph",
     "SkillNode",
     "NightlyTrainer",
+    "RewardEngine",
 ]

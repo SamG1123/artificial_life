@@ -7,3 +7,7 @@ requests
 selenium
 googlesearch-python
 groq
+kokoro-onnx
+sounddevice
+sentence-transformers
+websocket-client

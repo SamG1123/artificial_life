@@ -309,6 +309,7 @@ class AttentionSystem:
             "error", "crash", "fail", "critical", "alert", "warning",
             "user", "said", "speaking", "asking", "urgent", "stopped",
             "not responding", "high cpu", "low memory", "disk full",
+            "new window", "dialog", "popup", "major screen update",
         ]
         for kw in urgent_keywords:
             if kw in lower:

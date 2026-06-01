@@ -1,8 +1,12 @@
 venv/
 runs/
+.venv/
 .env
 __pycache__/
 *.pyc
+*.log
+logs/
+memory_store/
 dataset.py
 intent_dataset.csv
 train_intent.py
@@ -12,3 +16,9 @@ temp.py
 *.csv
 *.json
 *.gz
+*.log
+logs/
+*.safetensors
+asset/*.safetensors
+asset/*.onnx
+asset/gpt/

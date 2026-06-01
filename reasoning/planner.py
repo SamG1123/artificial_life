@@ -149,6 +149,50 @@ class TaskNode:
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
+    # ── Status propagation ──────────────────────────────────────
+
+    def propagate_status(self) -> None:
+        """Recompute this node's status from its children (bottom-up)."""
+        if self.is_leaf:
+            return
+        for c in self.children:
+            c.propagate_status()
+        statuses = [c.status for c in self.children]
+        if all(s == "done" for s in statuses):
+            self.status = "done"
+        elif any(s == "failed" for s in statuses):
+            self.status = "failed"
+        elif any(s == "in_progress" for s in statuses):
+            self.status = "in_progress"
+        else:
+            self.status = "pending"
+
+    def find_node(self, node_id: str) -> "TaskNode | None":
+        """DFS search for a node by id."""
+        if self.id == node_id:
+            return self
+        for c in self.children:
+            found = c.find_node(node_id)
+            if found:
+                return found
+        return None
+
+    def failed_subtasks(self) -> list["TaskNode"]:
+        """Return non-leaf children whose status is 'failed'."""
+        failed: list[TaskNode] = []
+        for c in self.children:
+            if c.status == "failed" and not c.is_leaf:
+                failed.append(c)
+            failed.extend(c.failed_subtasks())
+        return failed
+
+    def reset(self) -> None:
+        """Reset this subtree to pending (for re-planning)."""
+        self.status = "pending"
+        self.result = None
+        for c in self.children:
+            c.reset()
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -555,6 +599,62 @@ Example — Goal: "Create a folder called Projects on the Desktop"
 ]
 """
 
+_LLM_HIERARCHICAL_PROMPT = """\
+You are a task-planning AI for an autonomous Windows computer agent.
+
+Given a complex goal, decompose it into a HIERARCHICAL plan — a tree of sub-goals,
+each of which may contain further sub-goals or leaf-level actions.
+
+Leaf actions must be one of:
+  open_app, open_browser, navigate, search, click, type, press_key,
+  scroll, hotkey, download, run_command, draw_plan,
+  mouse_click_xy, mouse_drag, move_file, create_folder, delete_file, wait, done
+
+Output ONLY a JSON object with this schema.  No markdown, no explanation.
+
+Schema:
+{
+  "title": "overall goal title",
+  "children": [
+    {
+      "title": "sub-goal 1 title",
+      "children": [
+        {"title": "step description", "action": "open_browser", "target": "query"},
+        {"title": "step description", "action": "click", "target": "element"}
+      ]
+    },
+    {
+      "title": "sub-goal 2 title",
+      "children": [
+        {"title": "step description", "action": "type", "target": "text"}
+      ]
+    }
+  ]
+}
+
+Rules:
+- Nodes without "action" are sub-goals (intermediate nodes).
+- Nodes with "action" are leaf steps (executable).
+- Keep it minimal and practical. 2-4 sub-goals, each with 1-5 leaf steps.
+- The LAST leaf action in the whole tree must be {"action": "done", "target": ""}.
+- For simple goals (≤3 steps), use a flat structure (one sub-goal containing the steps).
+"""
+
+_LLM_REPAIR_PROMPT = """\
+You are repairing a FAILED sub-goal in a hierarchical task plan.
+
+The overall goal: {goal}
+The failed sub-goal: {subtask_title}
+Reason for failure: {reason}
+Steps already completed in other sub-goals: {completed_summary}
+World context: {world_context}
+
+Generate REPLACEMENT steps for the failed sub-goal only.
+Output ONLY a JSON array of step objects. Each step: {{"action": "...", "target": "..."}}
+Do NOT include a "done" action — the parent plan handles completion.
+Keep it minimal. Try a DIFFERENT approach than what failed.
+"""
+
 
 class Planner:
     """Decomposes a goal string into a Plan object."""
@@ -575,7 +675,8 @@ class Planner:
     def create_plan(self, goal: str, context: str = "") -> Plan:
         """Generate a Plan for *goal*.
 
-        Tries template match first, falls back to LLM.
+        Tries template match first, then hierarchical LLM for complex
+        goals, then flat LLM for simple ones.
         """
         # 1. Try template
         plan = self._try_template(goal)
@@ -584,12 +685,32 @@ class Planner:
             self._attach_hierarchy(plan)
             return plan
 
-        # 2. LLM planning
+        # 2. Detect complex goals → hierarchical planning
+        if self._is_complex_goal(goal):
+            plan = self.create_hierarchical_plan(goal, context)
+            # create_hierarchical_plan already sets metadata + tree
+            return plan
+
+        # 3. Simple goals → flat LLM planning
         plan = self._llm_plan(goal, context)
         plan.metadata["source"] = "llm"
         plan.metadata["model"] = self._model
         self._attach_hierarchy(plan)
         return plan
+
+    @staticmethod
+    def _is_complex_goal(goal: str) -> bool:
+        """Heuristic: is this goal complex enough to warrant hierarchical planning?"""
+        g = goal.lower()
+        # Multi-clause indicators
+        complexity_markers = [" and then ", " then ", " after that ",
+                              " first ", " finally ", " also ", " next "]
+        if any(m in g for m in complexity_markers):
+            return True
+        # Long goals with many words
+        if len(g.split()) >= 10:
+            return True
+        return False
 
     def schedule_task(
         self,
@@ -729,6 +850,132 @@ class Planner:
 
         plan = Plan(goal, steps)
         return plan
+
+    # ── Hierarchical LLM planning ────────────────────────────────
+
+    def create_hierarchical_plan(self, goal: str,
+                                 context: str = "") -> Plan:
+        """Produce a Plan with a proper task tree via the LLM.
+
+        Falls back to flat planning on failure.
+        """
+        user_msg = f"Goal: {goal}"
+        if context:
+            user_msg += f"\n\nContext:\n{context}"
+
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": _LLM_HIERARCHICAL_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=800,
+                temperature=0.2,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+            tree_data = json.loads(raw)
+            root = self._parse_tree_node(tree_data)
+            plan = Plan(goal)
+            plan.set_task_tree([root])
+            plan.metadata["source"] = "hierarchical_llm"
+            plan.metadata["model"] = self._model
+            return plan
+
+        except Exception as e:
+            print(f"[Planner] Hierarchical planning failed, falling back to flat: {e}")
+            return self.create_plan(goal, context)
+
+    def repair_subtask(self, plan: Plan, subtask_id: str,
+                       reason: str, world_context: str = "") -> bool:
+        """Replan only a failed subtask branch, keeping the rest intact.
+
+        Returns True if repair succeeded, False otherwise.
+        """
+        # Find the failed subtask node
+        target_node: TaskNode | None = None
+        for root in plan.task_tree:
+            target_node = root.find_node(subtask_id)
+            if target_node:
+                break
+
+        if not target_node:
+            return False
+
+        # Build a summary of completed steps for context
+        completed = [s for s in plan.steps if s.status == "done"]
+        completed_summary = ", ".join(
+            f"{s.action} {s.target}" for s in completed
+        ) or "(none)"
+
+        prompt = _LLM_REPAIR_PROMPT.format(
+            goal=plan.goal,
+            subtask_title=target_node.title,
+            reason=reason,
+            completed_summary=completed_summary,
+            world_context=world_context or "(none)",
+        )
+
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON arrays."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=400,
+                temperature=0.3,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+            new_steps: list[dict] = json.loads(raw)
+        except Exception as e:
+            print(f"[Planner] Subtask repair failed: {e}")
+            return False
+
+        # Replace the failed subtask's children with new leaves
+        target_node.children.clear()
+        target_node.reset()
+        for i, s in enumerate(new_steps):
+            target_node.add_child(TaskNode(
+                title=f"Repair step {i}: {s.get('action', 'done')}",
+                action=s.get("action", "done"),
+                target=s.get("target", ""),
+                metadata={"repaired": True},
+            ))
+
+        # Rebuild the flat step list from the (now-modified) tree
+        plan.steps = plan._flatten_tree_to_steps(plan.task_tree)
+        # Preserve done status for steps that already completed
+        # (their indices may have shifted, so match by action+target)
+        done_sigs = {(s.action, s.target) for s in completed}
+        for step in plan.steps:
+            if (step.action, step.target) in done_sigs:
+                step.status = "done"
+                done_sigs.discard((step.action, step.target))
+
+        plan.status = "in_progress"
+        plan.metadata["last_repair"] = subtask_id
+        return True
+
+    def _parse_tree_node(self, data: dict,
+                         parent_id: str | None = None) -> TaskNode:
+        """Recursively convert a JSON tree dict into TaskNode objects."""
+        node = TaskNode(
+            title=data.get("title", "task"),
+            action=data.get("action", ""),
+            target=data.get("target", ""),
+            parent_id=parent_id,
+        )
+        for child_data in data.get("children", []):
+            child = self._parse_tree_node(child_data, parent_id=node.id)
+            node.children.append(child)
+        return node
 
     def _attach_hierarchy(self, plan: Plan) -> None:
         """Build a practical task hierarchy from linear steps."""

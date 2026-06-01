@@ -4,6 +4,14 @@ import time
 import subprocess
 import socket
 
+import numpy as np
+import pyautogui as pag
+
+try:
+    import pygetwindow as gw
+except ImportError:
+    gw = None
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from action.base import BaseController
@@ -18,6 +26,11 @@ from selenium.webdriver.support import expected_conditions as EC
 
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 DEBUGGING_PORT = 9222  # Chrome remote-debugging port
+DEFAULT_CHROME_PROFILE = os.environ.get("CHROME_PROFILE_DIRECTORY", "Default")
+DEFAULT_AUTOMATION_USER_DATA_DIR = os.environ.get(
+    "CHROME_AUTOMATION_USER_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "memory_store", "chrome_automation_profile"),
+)
 
 
 def _is_port_open(port: int) -> bool:
@@ -48,6 +61,7 @@ def _find_chrome_path() -> str:
 class BrowserController(BaseController):
     def __init__(self):
         self.driver = None
+        self._profile_reader = None
 
     def is_available(self) -> bool:
         return self.is_running
@@ -73,33 +87,127 @@ class BrowserController(BaseController):
 
         # 1. If Chrome is not already running with debugging, start it
         if not _is_port_open(DEBUGGING_PORT):
-            chrome_path = _find_chrome_path()
-            user_data = os.path.expandvars(
-                r"%LocalAppData%\Google\Chrome\User Data"
-            )
-            cmd = [
-                chrome_path,
-                f"--remote-debugging-port={DEBUGGING_PORT}",
-                f"--user-data-dir={user_data}",
-                "--start-maximized",
-            ]
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Give Chrome a moment to spin up the debug listener
-            for _ in range(20):
-                if _is_port_open(DEBUGGING_PORT):
-                    break
-                time.sleep(0.5)
+            self._launch_debug_chrome(DEFAULT_AUTOMATION_USER_DATA_DIR)
+
+            # If the port still did not open, retry once with a fresh automation profile.
+            if not _is_port_open(DEBUGGING_PORT):
+                fallback_user_data = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "memory_store",
+                    "chrome_automation_profile_retry",
+                )
+                self._launch_debug_chrome(fallback_user_data)
+
+            if not _is_port_open(DEBUGGING_PORT):
+                raise RuntimeError("Chrome remote debugging port 9222 did not open")
 
         # 2. Connect Selenium to the running Chrome instance
         opts = Options()
         opts.debugger_address = f"127.0.0.1:{DEBUGGING_PORT}"
 
-        self.driver = webdriver.Chrome(options=opts)
+        try:
+            self.driver = webdriver.Chrome(options=opts)
+        except Exception:
+            self.driver = None
+            raise
+        self._dismiss_profile_picker()
         print("[Browser] Attached to Chrome (real profile, anti-captcha).")
+
+    def _launch_debug_chrome(self, user_data_dir: str) -> None:
+        chrome_path = _find_chrome_path()
+        os.makedirs(user_data_dir, exist_ok=True)
+        profile_dir = os.environ.get("CHROME_PROFILE_DIRECTORY", DEFAULT_CHROME_PROFILE)
+        cmd = [
+            chrome_path,
+            f"--remote-debugging-port={DEBUGGING_PORT}",
+            f"--user-data-dir={user_data_dir}",
+            f"--profile-directory={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--start-maximized",
+        ]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give Chrome a moment to spin up the debug listener.
+        for _ in range(20):
+            if _is_port_open(DEBUGGING_PORT):
+                break
+            time.sleep(0.5)
+
+    def _get_profile_reader(self):
+        if self._profile_reader is None:
+            import easyocr
+
+            self._profile_reader = easyocr.Reader(["en"], gpu=False)
+        return self._profile_reader
+
+    def _profile_picker_window_visible(self) -> bool:
+        if gw is None:
+            return False
+        try:
+            titles = [w.title.lower() for w in gw.getAllWindows() if w.title]
+        except Exception:
+            return False
+        markers = (
+            "choose your profile",
+            "choose a profile",
+            "profile picker",
+            "who's using chrome",
+            "who is using chrome",
+        )
+        return any(any(marker in title for marker in markers) for title in titles)
+
+    def _dismiss_profile_picker(self) -> bool:
+        """Try to close Chrome's native profile chooser by clicking a profile tile."""
+        if not self._profile_picker_window_visible():
+            return False
+
+        target_profile = os.environ.get("CHROME_PROFILE_DIRECTORY", DEFAULT_CHROME_PROFILE).strip().lower()
+        blocked_text = {
+            "add", "guest", "sign in", "continue as guest", "other", "manage people",
+        }
+
+        try:
+            reader = self._get_profile_reader()
+        except Exception:
+            return False
+
+        for _ in range(3):
+            try:
+                screenshot = pag.screenshot()
+                results = reader.readtext(np.array(screenshot))
+            except Exception:
+                return False
+
+            fallback = None
+            for box, text, confidence in results:
+                label = text.strip()
+                normalized = label.lower()
+                if not label or confidence < 0.35:
+                    continue
+                if target_profile and target_profile in normalized:
+                    x = int(sum(point[0] for point in box) / 4)
+                    y = int(sum(point[1] for point in box) / 4)
+                    pag.click(x, y)
+                    time.sleep(2)
+                    return True
+                if fallback is None and normalized not in blocked_text and len(label) <= 40:
+                    fallback = (box, label)
+
+            if fallback is not None:
+                box, _ = fallback
+                x = int(sum(point[0] for point in box) / 4)
+                y = int(sum(point[1] for point in box) / 4)
+                pag.click(x, y)
+                time.sleep(2)
+                return True
+
+            time.sleep(0.5)
+
+        return False
 
     # ── Navigation ───────────────────────────────────────────────────
 
@@ -112,14 +220,10 @@ class BrowserController(BaseController):
         )
 
     def search(self, query: str):
-        self.navigate("https://www.google.com")
+        from urllib.parse import quote_plus
+
+        self.navigate(f"https://www.google.com/search?q={quote_plus(query)}")
         try:
-            box = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.NAME, "q"))
-            )
-            box.clear()
-            box.send_keys(query)
-            box.send_keys(Keys.RETURN)
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "search"))
             )

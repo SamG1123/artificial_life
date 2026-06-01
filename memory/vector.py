@@ -19,12 +19,76 @@ Characteristics:
 import os
 import time
 import threading
+import hashlib
 from typing import Any
 
 import numpy as np
 
 # Capacity per category
 DEFAULT_CAPACITY = 500
+
+
+class LocalTextEmbedder:
+    """Local text embedding backend.
+
+    Uses sentence-transformers when available and falls back to a
+    deterministic hashing embedder so vector memory always works offline.
+    """
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", dim: int = 384):
+        self._dim = dim
+        self._backend = "hash"
+        self._model = None
+        self._model_name = model_name
+
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            self._model = SentenceTransformer(model_name)
+            self._backend = "sentence-transformers"
+            # Probe embedding dim from model output.
+            probe = self._model.encode(["probe"], normalize_embeddings=True)
+            if hasattr(probe, "shape") and len(probe.shape) == 2:
+                self._dim = int(probe.shape[1])
+        except Exception:
+            # Keep hash fallback.
+            self._model = None
+            self._backend = "hash"
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def encode(self, text: str) -> np.ndarray:
+        text = (text or "").strip()
+        if not text:
+            return np.zeros(self._dim, dtype=np.float32)
+
+        if self._model is not None:
+            try:
+                emb = self._model.encode([text], normalize_embeddings=True)[0]
+                return np.asarray(emb, dtype=np.float32).flatten()
+            except Exception:
+                pass
+
+        # Deterministic local fallback: bag-of-hashes projection.
+        vec = np.zeros(self._dim, dtype=np.float32)
+        tokens = text.lower().split()
+        if not tokens:
+            return vec
+        for tok in tokens:
+            digest = hashlib.sha256(tok.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % self._dim
+            sign = 1.0 if (digest[4] % 2 == 0) else -1.0
+            vec[idx] += sign
+
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        return vec
 
 
 class VectorMemory:
@@ -49,6 +113,7 @@ class VectorMemory:
 
         # In-memory store: {id → item_dict}
         self._items: dict[str, dict] = {}
+        self._embedder = LocalTextEmbedder()
         self._load()
 
     # ── Store ────────────────────────────────────────────────────
@@ -58,10 +123,14 @@ class VectorMemory:
         item_id: str,
         category: str,
         label: str,
-        embedding: np.ndarray,
+        embedding: np.ndarray | None = None,
         metadata: dict | None = None,
+        text: str = "",
     ) -> None:
         """Add or overwrite a vector in the store."""
+        if embedding is None:
+            source = text or label or str((metadata or {}).get("text", ""))
+            embedding = self.embed_text(source)
         embedding = np.asarray(embedding, dtype=np.float32).flatten()
         item = {
             "id": item_id,
@@ -75,6 +144,31 @@ class VectorMemory:
             self._items[item_id] = item
             self._enforce_capacity()
         self._save()
+
+    def store_text(
+        self,
+        item_id: str,
+        category: str,
+        text: str,
+        *,
+        label: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Store text by embedding it with the local backend."""
+        meta = dict(metadata or {})
+        meta.setdefault("text", text)
+        self.store(
+            item_id=item_id,
+            category=category,
+            label=label or text[:80],
+            embedding=None,
+            metadata=meta,
+            text=text,
+        )
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """Generate local embedding for text."""
+        return self._embedder.encode(text)
 
     # ── Retrieve ─────────────────────────────────────────────────
 
@@ -104,6 +198,8 @@ class VectorMemory:
         scored = []
         for item in candidates:
             emb = item["embedding"]
+            if emb.shape != query.shape:
+                continue
             emb_norm = np.linalg.norm(emb)
             if emb_norm == 0:
                 continue
@@ -120,6 +216,18 @@ class VectorMemory:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
+
+    def search_text(
+        self,
+        query_text: str,
+        *,
+        category: str | None = None,
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> list[dict]:
+        """Semantic search using local text embedding."""
+        q = self.embed_text(query_text)
+        return self.search(q, category=category, top_k=top_k, threshold=threshold)
 
     def get_by_id(self, item_id: str) -> dict | None:
         with self._lock:
@@ -171,6 +279,13 @@ class VectorMemory:
                 cat = v["category"]
                 counts[cat] = counts.get(cat, 0) + 1
         return counts
+
+    @property
+    def embedder_info(self) -> dict:
+        return {
+            "backend": self._embedder.backend,
+            "dim": self._embedder.dim,
+        }
 
     # ── Capacity management ──────────────────────────────────────
 

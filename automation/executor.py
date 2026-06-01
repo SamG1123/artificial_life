@@ -1,4 +1,5 @@
 from automation import browser_control
+from automation.screen_stream import ContinuousScreenStream
 import sys
 import os
 import json
@@ -7,12 +8,16 @@ import time
 import hashlib
 import subprocess
 import base64
+import re
 import warnings
 from io import BytesIO
 from queue import Full
 import easyocr
-import pyttsx3
 import speech_recognition as sr
+from tts import TextToSpeech as _TTS
+from logging_config import get_logger
+
+log = get_logger("executor")
 
 try:
     import pygetwindow as gw
@@ -42,6 +47,7 @@ MAX_REPEATS = 2  # auto-recover after this many identical actions
 MAX_AUTO_SCROLLS = 3  # cap consecutive auto-scrolls before forcing a reason step
 STEP_DELAY = 0.8  # seconds between actions
 OCR_MAX_WIDTH = 960  # downscale screenshots for faster OCR
+STREAM_FPS = 4.0
 
 
 class AutomationExecutor:
@@ -68,6 +74,7 @@ class AutomationExecutor:
         self._auto_scroll_count = 0  # consecutive auto-scroll recoveries
         self._current_screenshot_b64 = None  # base64 screenshot for vision model
         self._last_action_result = ""  # feedback from last action (success/failure/output)
+        self._stream = ContinuousScreenStream(fps=STREAM_FPS)
 
         # Decision system
         self.safety = SafetyValidator()
@@ -87,10 +94,13 @@ class AutomationExecutor:
         self._home_dir = os.path.expanduser('~').replace('/', os.sep)
         self._desktop_dir = os.path.join(self._home_dir, 'Desktop')
 
+        # ── Rollback tracking ──────────────────────────────────────
+        self._controllers = [self.app_ctrl, self.sys_ctrl, self.cam_ctrl]
+        self._consecutive_failures = 0
+        self._MAX_CONSECUTIVE_FAILURES = 5
+
         # ── Voice support ────────────────────────────────────────────
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 170)
-        self.tts_engine.setProperty('volume', 1.0)
+        self._tts = _TTS()
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
 
@@ -158,8 +168,13 @@ class AutomationExecutor:
             return pag.screenshot()
 
     def _capture_desktop_state(self):
-        """Fallback: screenshot + OCR for non-browser screens."""
-        screenshot = pag.screenshot()
+        """Fallback: latest streamed frame + OCR for non-browser screens."""
+        screenshot, shot_ts = self._stream.get_latest()
+        if screenshot is None:
+            screenshot = pag.screenshot()
+            shot_ts = time.time()
+        self.screen_state["stream_age_ms"] = round(max(0.0, (time.time() - shot_ts) * 1000.0), 1)
+        self.screen_state["stream_stats"] = self._stream.stats()
 
         try:
             global_ss_queue.put_nowait(screenshot)
@@ -263,12 +278,8 @@ class AutomationExecutor:
 
     def speak(self, message: str):
         """Speak a message aloud via TTS."""
-        print(f"  [VOICE] {message}")
-        try:
-            self.tts_engine.say(message)
-            self.tts_engine.runAndWait()
-        except Exception as e:
-            print(f"  [!] TTS error: {e}")
+        log.debug("[VOICE] %s", message)
+        self._tts.speak(message)
 
     def listen_for_confirmation(self, prompt: str, timeout: int = 8) -> bool:
         """Speak a prompt, then listen for 'yes'/'no' via microphone.
@@ -277,14 +288,14 @@ class AutomationExecutor:
         Returns True if user confirms, False otherwise.
         """
         self.speak(prompt)
-        print(f"  [Waiting for voice response... say 'yes' or 'no']")
+        log.debug("Waiting for voice response... say 'yes' or 'no'")
 
         try:
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=5)
             response = self.recognizer.recognize_google(audio).lower().strip()
-            print(f"  [Heard] '{response}'")
+            log.debug("Heard: '%s'", response)
             if any(w in response for w in ["yes", "yeah", "yep", "sure", "confirm", "go ahead", "do it"]):
                 self.speak("Confirmed.")
                 return True
@@ -292,9 +303,9 @@ class AutomationExecutor:
                 self.speak("Cancelled.")
                 return False
         except (sr.WaitTimeoutError, sr.UnknownValueError):
-            print("  [!] Couldn't hear response, falling back to console.")
+            log.warning("Couldn't hear response, falling back to console.")
         except sr.RequestError as e:
-            print(f"  [!] Speech recognition error: {e}, falling back to console.")
+            log.warning("Speech recognition error: %s, falling back to console.", e)
 
         # Fallback to console
         try:
@@ -319,12 +330,15 @@ class AutomationExecutor:
         action = action_dict.get("action", "done")
 
         # ── Safety gate ─────────────────────────────────────────
-        verdict, risk, reason = self.safety.validate(action_dict)
+        verdict, risk, reason = self.safety.validate(
+            action_dict,
+            goal_context=self.goal or "",
+        )
         domain = self.router.route(action_dict, self._browser_mode)
-        print(f"  -> Executing action: {action_dict}  [domain={domain.value}, risk={risk.name}]")
+        log.info("Executing action: %s  [domain=%s, risk=%s]", action_dict, domain.value, risk.name)
 
         if verdict == SafetyVerdict.BLOCK:
-            print(f"  [BLOCKED] {reason}")
+            log.warning("BLOCKED: %s", reason)
             self._last_action_result = f"BLOCKED: {reason}"
             self.speak(f"I blocked that action for safety: {reason}")
             return False
@@ -333,8 +347,9 @@ class AutomationExecutor:
             confirmed = self.listen_for_confirmation(
                 f"This action needs your approval: {reason}. Should I proceed?"
             )
+            self.safety.record_confirmation(action_dict, confirmed)
             if not confirmed:
-                print(f"  [CANCELLED] User declined: {reason}")
+                log.info("CANCELLED by user: %s", reason)
                 self._last_action_result = f"CANCELLED by user: {reason}"
                 return False
 
@@ -346,7 +361,7 @@ class AutomationExecutor:
 
         elif action == "press_key":
             key = action_dict.get("key", "Enter")
-            print(f"    Pressing key: {key}")
+            log.debug("Pressing key: %s", key)
             if self._browser_mode:
                 self.browser.press_key(key)
             else:
@@ -356,7 +371,7 @@ class AutomationExecutor:
             self._do_scroll(action_dict.get("direction", "down"))
 
         elif action == "open_app":
-            self._do_open_app(action_dict.get("app_name", ""))
+            self._do_open_app(action_dict.get("app_name") or action_dict.get("target", ""))
 
         elif action == "open_browser":
             self._do_open_browser(action_dict.get("query", ""))
@@ -364,7 +379,7 @@ class AutomationExecutor:
         elif action == "navigate":
             url = action_dict.get("url", "")
             if url and self._browser_mode:
-                print(f"    Navigating to: {url}")
+                log.info("Navigating to: %s", url)
                 self.browser.navigate(url)
                 time.sleep(1)
 
@@ -373,7 +388,7 @@ class AutomationExecutor:
 
         elif action == "go_back":
             if self._browser_mode:
-                print("    Going back")
+                log.debug("Going back")
                 self.browser.go_back()
 
         elif action == "mouse_drag":
@@ -381,7 +396,7 @@ class AutomationExecutor:
 
         elif action == "mouse_click_xy":
             x, y = action_dict.get("x", 0), action_dict.get("y", 0)
-            print(f"    Clicking at ({x}, {y})")
+            log.debug("Clicking at (%d, %d)", x, y)
             pag.click(x, y)
             time.sleep(0.3)
             self._last_action_result = f"Clicked at ({x}, {y})"
@@ -389,7 +404,7 @@ class AutomationExecutor:
         elif action == "hotkey":
             keys = action_dict.get("keys", [])
             if keys:
-                print(f"    Hotkey: {'+'.join(keys)}")
+                log.debug("Hotkey: %s", '+'.join(keys))
                 pag.hotkey(*keys)
                 time.sleep(0.3)
                 self._last_action_result = f"Pressed {'+'.join(keys)}"
@@ -401,7 +416,7 @@ class AutomationExecutor:
             self._do_draw_plan(action_dict.get("subject", ""))
 
         elif action == "done":
-            print("  [OK] Goal marked as done by reasoning model.")
+            log.info("Goal marked as done by reasoning model.")
             # Announce what was found
             page_text = self.screen_state.get("page_text", "")
             if page_text and self._browser_mode:
@@ -411,29 +426,29 @@ class AutomationExecutor:
             return True
 
         else:
-            print(f"  [!] Unknown action '{action}', skipping.")
+            log.warning("Unknown action '%s', skipping.", action)
 
         return False
 
     def _do_click(self, target_id):
         if target_id is None:
-            print("  [!] click action missing target_id")
+            log.warning("click action missing target_id")
             return False
         element = self._find_element(target_id)
         if not element:
-            print(f"  [!] Element with id {target_id} not found")
+            log.warning("Element with id %s not found", target_id)
             return False
 
         if self._browser_mode:
             # Use Playwright — index into _page_elements (id is 1-based)
             idx = target_id - 1
             result = self.browser.click_element(idx, self._page_elements)
-            print(f"    {result}")
+            log.debug("%s", result)
         else:
             x, y = element["center"]
             x = max(0, min(x, self.width - 1))
             y = max(0, min(y, self.height - 1))
-            print(f"    Clicking \"{element['text'][:50]}\" at ({x}, {y})")
+            log.debug("Clicking \"%s\" at (%d, %d)", element['text'][:50], x, y)
             pag.moveTo(x, y, duration=0.15)
             time.sleep(0.1)
             pag.click()
@@ -443,20 +458,20 @@ class AutomationExecutor:
     def _do_download(self, target_id):
         """Download a file (confirmation already handled by SafetyValidator)."""
         if target_id is None:
-            print("  [!] download action missing target_id")
+            log.warning("download action missing target_id")
             return False
         if not self._browser_mode:
-            print("  [!] download only works in browser mode")
+            log.warning("download only works in browser mode")
             return False
 
         element = self._find_element(target_id)
         if not element:
-            print(f"  [!] Element with id {target_id} not found")
+            log.warning("Element with id %s not found", target_id)
             return False
 
         idx = target_id - 1
         result = self.browser.download_file(idx, self._page_elements)
-        print(f"    {result}")
+        log.info("%s", result)
         if result.startswith("Downloaded:"):
             self.speak(f"Download complete. {result}")
             return True
@@ -466,16 +481,16 @@ class AutomationExecutor:
 
     def _do_type(self, text: str):
         if not text:
-            print("  [!] type action has empty text")
+            log.warning("type action has empty text")
             return
-        print(f"    Typing: \"{text}\"")
+        log.debug("Typing: \"%s\"", text)
         if self._browser_mode:
             self.browser.type_text(text)
         else:
             pag.typewrite(text, interval=0.03)
 
     def _do_scroll(self, direction: str):
-        print(f"    Scrolling {direction}")
+        log.debug("Scrolling %s", direction)
         if self._browser_mode:
             self.browser.scroll_page(direction)
         else:
@@ -487,14 +502,167 @@ class AutomationExecutor:
 
     def _do_open_browser(self, query: str):
         if not query:
-            print("  [!] open_browser action missing query")
+            log.warning("open_browser action missing query")
             return
-        print(f"    Opening browser and searching: {query}")
+        log.info("Opening browser and searching: %s", query)
         if not self.browser.is_running:
             self.browser.start_browser()
-        self.browser.search(query)
         self._browser_mode = True
+
+        if self._looks_like_latest_video_goal(query):
+            channel_url = self._guess_youtube_channel_url(query)
+            if channel_url:
+                log.info("Using YouTube channel videos page: %s", channel_url)
+                self.browser.navigate(channel_url)
+                time.sleep(1.5)
+                if self._click_first_youtube_video():
+                    return
+
+        cleaned_query = self._clean_search_query(query)
+        self.browser.search(cleaned_query)
         time.sleep(1.5)
+
+        if self._looks_like_latest_video_goal(query):
+            self._click_first_youtube_video()
+
+    def _clean_search_query(self, query: str) -> str:
+        cleaned = query
+        cleaned = re.sub(r"\busing\s+chrome\s+profile\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\busing\s+chrome\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\busing\s+the\s+chrome\s+profile\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\busing\s+browser\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _maybe_follow_visible_result(self, goal: str) -> bool:
+        """Use the current visible page to pick the next obvious result."""
+        if not self._browser_mode or not self.screen_state.get("elements"):
+            return False
+
+        title = (self.screen_state.get("title", "") or "").lower()
+        url = (self.screen_state.get("url", "") or "").lower()
+        page_text = (self.screen_state.get("page_text", "") or "").lower()
+        elements = self.screen_state.get("elements", [])
+        goal_lower = goal.lower()
+
+        if "google" not in url and "google" not in title and "search" not in page_text:
+            return False
+
+        # Fast path for YouTube/video tasks: prefer a visible watch result.
+        if "youtube" in goal_lower or "video" in goal_lower:
+            candidates = self._rank_visible_links(goal_lower, elements, prefer_domain="youtube.com")
+            if candidates:
+                idx = candidates[0]
+                result = self.browser.click_element(idx, elements)
+                log.info("Auto-followed visible YouTube result #%d: %s", idx, result)
+                time.sleep(1.5)
+                return True
+
+        candidates = self._rank_visible_links(goal_lower, elements)
+        if candidates:
+            idx = candidates[0]
+            result = self.browser.click_element(idx, elements)
+            log.info("Auto-followed visible result #%d: %s", idx, result)
+            time.sleep(1.5)
+            return True
+
+        return False
+
+    def _rank_visible_links(self, goal_lower: str, elements: list[dict], prefer_domain: str = "") -> list[int]:
+        goal_tokens = [
+            token for token in re.findall(r"[a-z0-9]+", goal_lower)
+            if len(token) > 2 and token not in {"using", "chrome", "profile", "open", "latest", "newest"}
+        ]
+        scored: list[tuple[int, int]] = []
+        for idx, element in enumerate(elements):
+            href = (element.get("href") or "").lower()
+            text = (element.get("text") or "").lower()
+            if not href:
+                continue
+            if "google" in href and prefer_domain and prefer_domain not in href:
+                continue
+
+            score = 0
+            if prefer_domain and prefer_domain in href:
+                score += 6
+            if any(token in text for token in goal_tokens):
+                score += 3
+            if any(token in href for token in goal_tokens):
+                score += 2
+            if "/watch" in href or "videos" in href or "shorts" in href:
+                score += 2
+            if text and text not in {"google", "videos", "video", "shorts"}:
+                score += 1
+            scored.append((score, idx))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [idx for score, idx in scored if score > 0]
+
+    def _looks_like_latest_video_goal(self, goal: str) -> bool:
+        goal_lower = goal.lower()
+        return "youtube" in goal_lower and (
+            "latest video" in goal_lower
+            or "newest video" in goal_lower
+            or "latest" in goal_lower
+            or "newest" in goal_lower
+        )
+
+    def _guess_youtube_channel_url(self, goal: str) -> str | None:
+        goal_lower = goal.lower()
+        if "mr beast" in goal_lower or "mrbeast" in goal_lower:
+            return "https://www.youtube.com/@MrBeast/videos"
+
+        match = re.search(r"from\s+(.+?)(?:\s+on\s+youtube|\s+using\s+chrome|\s+using|\s+youtube|$)", goal, re.I)
+        if not match:
+            return None
+
+        raw_name = match.group(1).strip()
+        cleaned = re.sub(
+            r"\b(latest|newest|video|videos|open|watch|the|a|an|using|chrome|profile)\b",
+            "",
+            raw_name,
+            flags=re.I,
+        ).strip()
+        cleaned = re.sub(r"\s+", "", cleaned)
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", cleaned)
+        if not cleaned:
+            return None
+        return f"https://www.youtube.com/@{cleaned}/videos"
+
+    def _click_first_youtube_video(self) -> bool:
+        if not self.browser.is_running:
+            return False
+
+        try:
+            elements = self.browser.get_page_elements(max_elements=80)
+        except Exception:
+            return False
+
+        candidates: list[tuple[int, int]] = []
+        for idx, el in enumerate(elements):
+            href = (el.get("href") or "").lower()
+            text = (el.get("text") or "").strip().lower()
+            if "youtube.com/watch" in href or "/watch?v=" in href or "youtube.com/shorts" in href:
+                score = 0
+                if text and text not in {"videos", "video", "shorts"}:
+                    score -= 2
+                if "shorts" in href:
+                    score += 2
+                candidates.append((score, idx))
+
+        if not candidates:
+            return False
+
+        candidates.sort(key=lambda item: item[0])
+        _, best_idx = candidates[0]
+        try:
+            result = self.browser.click_element(best_idx, elements)
+            log.info("Clicked YouTube video candidate #%d: %s", best_idx, result)
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            log.warning("Failed to click first YouTube video: %s", e)
+            return False
 
     def _find_element(self, target_id: int):
         for el in self.screen_state["elements"]:
@@ -510,7 +678,7 @@ class AutomationExecutor:
         y1 = action_dict.get("y1", 0)
         x2 = action_dict.get("x2", 0)
         y2 = action_dict.get("y2", 0)
-        print(f"    Dragging ({x1},{y1}) -> ({x2},{y2})")
+        log.debug("Dragging (%d,%d) -> (%d,%d)", x1, y1, x2, y2)
         pag.moveTo(x1, y1, duration=0.1)
         pag.mouseDown()
         pag.moveTo(x2, y2, duration=0.15)
@@ -529,9 +697,9 @@ class AutomationExecutor:
         (typically Paint). No separate module needed.
         """
         if not subject:
-            print("  [!] draw_plan missing subject")
+            log.warning("draw_plan missing subject")
             return
-        print(f"    Generating drawing plan for: {subject}")
+        log.info("Generating drawing plan for: %s", subject)
 
         # Detect the active window's canvas area
         try:
@@ -585,11 +753,11 @@ Rules:
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             plan = json.loads(raw)
         except Exception as e:
-            print(f"    [!] Failed to generate drawing plan: {e}")
+            log.warning("Failed to generate drawing plan: %s", e)
             return
 
         if not isinstance(plan, list) or not plan:
-            print("    [!] Empty or invalid drawing plan")
+            log.warning("Empty or invalid drawing plan")
             return
 
         # Helper: convert logical coords to screen coords
@@ -650,7 +818,7 @@ Rules:
 
         for i, cmd in enumerate(plan):
             action = cmd.get("cmd", "")
-            print(f"    [draw {i+1}/{len(plan)}] {action}")
+            log.debug("[draw %d/%d] %s", i+1, len(plan), action)
             try:
                 if action == "color":
                     pick_palette_color(cmd.get("r",0), cmd.get("g",0), cmd.get("b",0))
@@ -693,11 +861,11 @@ Rules:
                     pag.mouseUp()
 
             except Exception as e:
-                print(f"    [!] Draw error: {e}")
+                log.warning("Draw error: %s", e)
             time.sleep(0.08)
 
         pag.PAUSE = saved_pause  # restore
-        print("    Drawing complete.")
+        log.info("Drawing complete.")
         self._last_action_result = f"SUCCESS: drew {subject} with {len(plan)} strokes"
 
     # ── Main loop ────────────────────────────────────────────────────
@@ -711,21 +879,31 @@ Rules:
         self._last_screen_hash = None
         self._consecutive_unchanged = 0
         self._auto_scroll_count = 0
+        self._consecutive_failures = 0
         step = 0
+
+        # Clear undo stacks at goal start
+        for ctrl in self._controllers:
+            if hasattr(ctrl, 'clear_undo'):
+                ctrl.clear_undo()
 
         # Let the reasoning engine create a plan for this goal
         if hasattr(self.engine, 'set_goal'):
             plan = self.engine.set_goal(goal)
-            print(f"\n  Plan: {plan.summary()}\n")
+            log.info("Plan: %s", plan.summary())
 
-        print(f"\n{'='*60}")
-        print(f"  GOAL: {goal}")
-        print(f"{'='*60}\n")
+        log.info("="*60)
+        log.info("GOAL: %s", goal)
+        log.info("="*60)
         self.speak(f"Starting goal: {goal}")
+
+        # Start continuous screen stream for low-latency desktop awareness.
+        if not self._stream.is_running:
+            self._stream.start()
 
         # Auto-open browser for goals that clearly need web search
         if self._goal_needs_browser(goal) and not self.browser.is_running:
-            print("  [Auto] Goal requires web browsing — opening browser...")
+            log.info("Goal requires web browsing — opening browser...")
             self._do_open_browser(goal)  # searches the goal directly
             step = 1
             self.action_history.append({
@@ -737,10 +915,10 @@ Rules:
 
         while not self.goal_completed and step < MAX_STEPS:
             step += 1
-            print(f"\n-- Step {step}/{MAX_STEPS} --")
+            log.info("-- Step %d/%d --", step, MAX_STEPS)
 
             # 1. Observe
-            print("  Capturing screen state...")
+            log.debug("Capturing screen state...")
             screenshot = self.capture_screen_state()
             screen_hash = self._hash_screenshot(screenshot)
             screen_changed = (screen_hash != self._last_screen_hash)
@@ -756,10 +934,10 @@ Rules:
             extra_info = ""
             if self._browser_mode:
                 extra_info = f"  URL: {self.screen_state.get('url', '?')}"
-            print(f"  Found {elem_count} elements  "
-                  f"(screen {'changed' if screen_changed else 'unchanged'})")
+            log.debug("Found %d elements  (screen %s)",
+                      elem_count, 'changed' if screen_changed else 'unchanged')
             if extra_info:
-                print(extra_info)
+                log.debug("%s", extra_info)
 
             # Mark last-clicked element as failed if screen didn't change
             if not screen_changed and self.action_history:
@@ -768,13 +946,13 @@ Rules:
                     failed_id = last.get("target_id")
                     if failed_id is not None:
                         self._failed_ids.add(failed_id)
-                        print(f"  [!] Action on [{failed_id}] had no effect, blacklisting")
+                        log.debug("Action on [%s] had no effect, blacklisting", failed_id)
 
             # 2. Auto-recover if stuck
             if self._is_stuck() and self._auto_scroll_count < MAX_AUTO_SCROLLS:
                 self._auto_scroll_count += 1
-                print(f"  [!] Stuck -- same action repeated. Auto-scrolling down. "
-                      f"({self._auto_scroll_count}/{MAX_AUTO_SCROLLS})")
+                log.info("Stuck — same action repeated. Auto-scrolling down. (%d/%d)",
+                         self._auto_scroll_count, MAX_AUTO_SCROLLS)
                 self._do_scroll("down")
                 # Record the auto-scroll in history so _is_stuck() won't loop
                 self.action_history.append({
@@ -788,8 +966,8 @@ Rules:
 
             if self._consecutive_unchanged >= 3 and self._auto_scroll_count < MAX_AUTO_SCROLLS:
                 self._auto_scroll_count += 1
-                print(f"  [!] Screen unchanged for 3 steps. Scrolling to reveal new content. "
-                      f"({self._auto_scroll_count}/{MAX_AUTO_SCROLLS})")
+                log.info("Screen unchanged for 3 steps. Scrolling to reveal new content. (%d/%d)",
+                         self._auto_scroll_count, MAX_AUTO_SCROLLS)
                 self._do_scroll("down")
                 self.action_history.append({
                     "step": step,
@@ -801,11 +979,16 @@ Rules:
                 time.sleep(0.5)
                 continue
 
+            # If we are already on a browser/search page, let the visible page
+            # tell us what to do next before falling back to the LLM.
+            if self._maybe_follow_visible_result(self.goal):
+                continue
+
             # Reset auto-scroll counter once we reach a normal reasoning step
             self._auto_scroll_count = 0
 
             # 3. Reason
-            print("  Querying reasoning model...")
+            log.debug("Querying reasoning model...")
             filtered_elements = [
                 e for e in self.screen_state["elements"]
                 if e["id"] not in self._failed_ids
@@ -870,21 +1053,40 @@ Rules:
                     world_context=history_context,
                 )
 
+            # Track consecutive failures for rollback trigger
+            if result_note.startswith("FAILED") or result_note.startswith("BLOCKED"):
+                self._consecutive_failures += 1
+            else:
+                self._consecutive_failures = 0
+
+            if self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
+                log.warning("%d consecutive failures — triggering rollback",
+                            self._consecutive_failures)
+                self._rollback_actions()
+                self._consecutive_failures = 0
+
             time.sleep(STEP_DELAY)
 
         # Cleanup
         if self.goal_completed:
             msg = f"Goal completed in {step} steps."
-            print(f"\n[OK] {msg}")
+            log.info(msg)
             self.speak(msg)
+            # Success — discard undo entries
+            for ctrl in self._controllers:
+                if hasattr(ctrl, 'clear_undo'):
+                    ctrl.clear_undo()
         else:
             msg = f"Could not complete the goal after {MAX_STEPS} steps."
-            print(f"\n[!] {msg}")
+            log.warning(msg)
             self.speak(msg)
 
         if self.browser.is_running:
             self.browser.close_browser()
             self._browser_mode = False
+
+        # Stop stream after this goal run to free resources.
+        self._stream.stop()
 
         # Clean up TTS engine safely
         try:
@@ -963,6 +1165,26 @@ Rules:
         recent = [json.dumps(h["action"], sort_keys=True)
                   for h in self.action_history[-MAX_REPEATS:]]
         return len(set(recent)) == 1
+
+    def _rollback_actions(self) -> None:
+        """Unwind reversible actions registered by controllers."""
+        rolled_back = 0
+        for ctrl in self._controllers:
+            if not hasattr(ctrl, 'pop_undo'):
+                continue
+            while True:
+                entry = ctrl.pop_undo()
+                if entry is None:
+                    break
+                try:
+                    result = entry.undo_fn()
+                    rolled_back += 1
+                    log.info("Rolled back: %s → %s", entry.description, result)
+                except Exception as e:
+                    log.warning("Rollback failed for '%s': %s", entry.description, e)
+        if rolled_back:
+            log.info("Rolled back %d action(s)", rolled_back)
+            self.speak(f"I had to undo {rolled_back} actions after repeated failures.")
 
     # ── Legacy helpers ───────────────────────────────────────────────
 

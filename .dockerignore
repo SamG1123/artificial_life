@@ -1,0 +1,21 @@
+# Exclude large model assets and build artifacts
+asset/
+asset/*
+intent_model/
+runs/
+learning/runs/
+memory_store/
+venv/
+.venv/
+__pycache__/
+.git/
+.gitignore
+*.safetensors
+*.pt
+*.onnx
+*.ckpt
+*.zip
+*.tar.gz
+*.log
+node_modules/
+.DS_Store

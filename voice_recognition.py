@@ -27,10 +27,18 @@ class SpeechSupport:
 
         # Allow dynamic threshold adjustment to adapt over time
         self.recognizer.dynamic_energy_threshold = True
+        last_mode = None
 
         while not stop_event.is_set():
+            mode = "sleep" if self.sleep else "awake"
+            if mode != last_mode:
+                if self.sleep:
+                    print("[SpeechSupport] Waiting for wake word...")
+                else:
+                    print("[SpeechSupport] Listening...")
+                last_mode = mode
+
             with self.microphone as source:
-                print("Listening...")
                 try:
                     audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
                 except r.WaitTimeoutError:
